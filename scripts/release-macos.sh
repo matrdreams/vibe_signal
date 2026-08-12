@@ -10,6 +10,22 @@ NOTARY_PROFILE="${VIBE_SIGNAL_NOTARY_PROFILE:-}"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST")"
 BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO_PLIST")"
 DMG="$DIST/Vibe-Signal-$VERSION-universal.dmg"
+NOTARY_ARCHIVE="$DIST/Vibe-Signal-$VERSION-notarization.zip"
+
+if [[ -z "$NOTARY_PROFILE" ]]; then
+    cat >&2 <<'EOF'
+Missing VIBE_SIGNAL_NOTARY_PROFILE.
+
+Public releases must be notarized. Store Apple notary credentials in the
+Keychain first, then rerun this script with the profile name, for example:
+
+  xcrun notarytool store-credentials VibeSignalNotary \
+    --apple-id "YOUR_APPLE_ID" \
+    --team-id "3TBP5MLMTQ"
+  VIBE_SIGNAL_NOTARY_PROFILE=VibeSignalNotary ./scripts/release-macos.sh
+EOF
+    exit 1
+fi
 
 if [[ "${VIBE_SIGNAL_SKIP_BUILD:-0}" != "1" ]]; then
     "$ROOT/scripts/build-app.sh"
@@ -37,6 +53,18 @@ sign "$APP"
 
 codesign --verify --deep --strict --verbose=2 "$APP"
 
+# Notarize and staple the app itself before placing it in the disk image. This
+# keeps the installed copy verifiable even when the Mac cannot contact Apple.
+rm -f "$NOTARY_ARCHIVE"
+ditto -c -k --keepParent "$APP" "$NOTARY_ARCHIVE"
+xcrun notarytool submit "$NOTARY_ARCHIVE" \
+    --keychain-profile "$NOTARY_PROFILE" \
+    --wait
+rm -f "$NOTARY_ARCHIVE"
+xcrun stapler staple "$APP"
+xcrun stapler validate "$APP"
+spctl --assess --type execute --verbose=4 "$APP"
+
 STAGING="$(mktemp -d "$DIST/dmg-staging.XXXXXX")"
 cleanup() {
     if [[ -d "$STAGING" ]]; then
@@ -59,15 +87,12 @@ hdiutil create \
 sign "$DMG"
 codesign --verify --strict --verbose=2 "$DMG"
 
-if [[ -n "$NOTARY_PROFILE" ]]; then
-    xcrun notarytool submit "$DMG" \
-        --keychain-profile "$NOTARY_PROFILE" \
-        --wait
-    xcrun stapler staple "$DMG"
-    xcrun stapler validate "$DMG"
-else
-    echo "Notarization skipped: set VIBE_SIGNAL_NOTARY_PROFILE to a notarytool keychain profile." >&2
-fi
+xcrun notarytool submit "$DMG" \
+    --keychain-profile "$NOTARY_PROFILE" \
+    --wait
+xcrun stapler staple "$DMG"
+xcrun stapler validate "$DMG"
+spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG"
 
 echo "app: $APP"
 echo "dmg: $DMG"
