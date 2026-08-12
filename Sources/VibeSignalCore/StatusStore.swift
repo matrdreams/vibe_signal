@@ -35,7 +35,19 @@ public final class StatusStore {
 
     public func apply(_ event: SignalEvent, now: Date = Date()) {
         let publishedSnapshot: SignalSnapshot? = queue.sync {
-            eventsByKey[event.sessionKey] = event
+            var mergedEvent = event
+            if let previousEvent = eventsByKey[event.sessionKey] {
+                mergedEvent.title = mergedEvent.title ?? previousEvent.title
+                mergedEvent.workspace = mergedEvent.workspace ?? previousEvent.workspace
+
+                var metadata = previousEvent.metadata ?? [:]
+                for (key, value) in mergedEvent.metadata ?? [:] {
+                    metadata[key] = value
+                }
+                mergedEvent.metadata = metadata.isEmpty ? nil : metadata
+            }
+
+            eventsByKey[mergedEvent.sessionKey] = mergedEvent
             let snapshot = makeSnapshot(now: now)
             eventsByKey = Dictionary(uniqueKeysWithValues: snapshot.sessions.map { ($0.sessionKey, $0) })
             return publishIfChanged(snapshot)

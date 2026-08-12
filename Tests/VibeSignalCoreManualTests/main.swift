@@ -70,7 +70,7 @@ func appendLine(_ line: String, to file: URL) throws {
 let now = Date()
 
 let emptySnapshot = SignalSnapshot.make(from: [], now: now)
-assertEqual(emptySnapshot.globalState, .idle, "empty session set should be idle")
+assertEqual(emptySnapshot.globalState, .unknown, "empty session set should be unknown")
 
 let working = SignalEvent(
     source: "codex",
@@ -91,6 +91,17 @@ let blocked = SignalEvent(
 let snapshot = SignalSnapshot.make(from: [working, blocked], now: now)
 assertEqual(snapshot.globalState, .blocked, "blocked should outrank working")
 assertEqual(snapshot.sessions.map(\.sessionId), ["blocked", "working"], "sessions should sort by state priority")
+
+let unknown = SignalEvent(
+    source: "codex",
+    adapter: "test",
+    sessionId: "unknown",
+    state: .unknown,
+    reason: SignalReason.stale,
+    updatedAt: now
+)
+let uncertainSnapshot = SignalSnapshot.make(from: [working, unknown], now: now)
+assertEqual(uncertainSnapshot.globalState, .unknown, "unknown should prevent an unverified global colour")
 
 let expired = SignalEvent(
     source: "codex",
@@ -139,6 +150,37 @@ let jsonEvent = SignalEvent(
 let encoded = try SignalJSON.encode(jsonEvent)
 let decoded = try SignalJSON.decode(SignalEvent.self, from: encoded)
 assertEqual(decoded, jsonEvent, "JSON event should round trip")
+
+let hookInput = Data(#"{"session_id":"thread-hook","turn_id":"turn-hook","cwd":"/tmp/hook","hook_event_name":"UserPromptSubmit","prompt":"private prompt must not be forwarded"}"#.utf8)
+let hookEvent = try CodexHookBridge.makeEvent(from: hookInput, now: now)
+assertEqual(hookEvent?.state, .working, "user prompt hook should provide a low-latency working hint")
+assertEqual(hookEvent?.sessionId, "thread-hook", "hook should preserve the official session id")
+assertTrue(hookEvent?.metadata?["prompt"] == nil, "hook bridge must not forward prompt content")
+
+let permissionHookInput = Data(#"{"session_id":"thread-hook","turn_id":"turn-hook","cwd":"/tmp/hook","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"private"}}"#.utf8)
+let permissionHookEvent = try CodexHookBridge.makeEvent(from: permissionHookInput, now: now)
+assertEqual(permissionHookEvent?.state, .working, "permission hook alone must not claim user attention")
+assertTrue(permissionHookEvent?.metadata?["tool_input"] == nil, "hook bridge must not forward tool input")
+
+let hookConfigRoot = FileManager.default.temporaryDirectory
+    .appendingPathComponent("VibeSignalManualTests-Hooks-\(UUID().uuidString)", isDirectory: true)
+try FileManager.default.createDirectory(at: hookConfigRoot, withIntermediateDirectories: true)
+defer {
+    try? FileManager.default.removeItem(at: hookConfigRoot)
+}
+let hookConfigURL = hookConfigRoot.appendingPathComponent("hooks.json")
+let existingHooks = #"{"hooks":{"SessionStart":[{"matcher":"resume","hooks":[{"type":"command","command":"/usr/bin/true"}]}]}}"#
+try Data(existingHooks.utf8).write(to: hookConfigURL)
+let hookManager = CodexHookConfigurationManager(
+    configurationURL: hookConfigURL,
+    executableURL: URL(fileURLWithPath: "/usr/bin/true")
+)
+try hookManager.install()
+assertTrue(hookManager.isInstalled(), "hook integration should install all lifecycle events")
+try hookManager.uninstall()
+assertTrue(!hookManager.isInstalled(), "hook integration should uninstall its own handlers")
+let preservedHookConfig = try String(contentsOf: hookConfigURL)
+assertTrue(preservedHookConfig.contains("resume"), "hook integration must preserve existing Codex hooks")
 
 assertTrue(
     VibeSignalError.socketAlreadyRunning("/tmp/vibe-signal.sock").isSocketOwnershipConflict,
@@ -296,7 +338,7 @@ assertTrue(
 )
 
 try appendLine(
-    #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sleep 5\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"test\"}","call_id":"call-approval"}}"#,
+    #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"exec_approval_request","call_id":"call-approval","turn_id":"turn-approval"}}"#,
     to: approvalSessionFile
 )
 assertTrue(
@@ -306,6 +348,13 @@ assertTrue(
     "escalated command should emit blocked approval"
 )
 assertEqual(approvalRecorder.last?.reason, SignalReason.approval, "approval block should use approval reason")
+
+try appendLine(
+    #"{"timestamp":"2026-05-24T10:23:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-unrelated","output":"done"}}"#,
+    to: approvalSessionFile
+)
+Thread.sleep(forTimeInterval: 0.2)
+assertEqual(approvalRecorder.last?.state, .blocked, "unrelated tool output must not clear approval")
 
 try appendLine(
     #"{"timestamp":"2026-05-24T10:23:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-approval","output":"done"}}"#,
@@ -333,7 +382,7 @@ _ = try writeSessionFile(
     lines: [
         #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5994-3333-7444-8555-666677778888","cwd":"/tmp/seeded-approval","originator":"codex-tui"}}"#,
         #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-seeded-approval"}}"#,
-        #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sleep 5\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"test\"}","call_id":"call-seeded-approval"}}"#
+        #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"exec_approval_request","call_id":"call-seeded-approval","turn_id":"turn-seeded-approval"}}"#
     ]
 )
 let seededApprovalRecorder = EventRecorder()
@@ -404,6 +453,7 @@ let autoReviewSessionFile = try writeSessionFile(
     sessionID: autoReviewSessionID,
     lines: [
         #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5995-3333-7444-8555-666677778888","cwd":"/tmp/auto-review","originator":"codex-tui"}}"#,
+        #"{"timestamp":"2026-05-24T10:22:51.645Z","type":"turn_context","payload":{"turn_id":"turn-auto-review","cwd":"/tmp/auto-review","approval_policy":"on-request","approvals_reviewer":"auto_review"}}"#,
         #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-auto-review"}}"#
     ]
 )
@@ -428,14 +478,14 @@ assertTrue(
 )
 
 try appendLine(
-    #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"true\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"test\"}","call_id":"call-auto-review"}}"#,
+    #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.exec_command({cmd: \"true\", sandbox_permissions: \"require_escalated\"});","call_id":"call-auto-review"}}"#,
     to: autoReviewSessionFile
 )
 Thread.sleep(forTimeInterval: 0.2)
 assertTrue(autoReviewRecorder.last?.state != .blocked, "blocked state should be debounced before reaching the UI")
 
 try appendLine(
-    #"{"timestamp":"2026-05-24T10:23:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-auto-review","output":"done"}}"#,
+    #"{"timestamp":"2026-05-24T10:23:01.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-auto-review","output":"done"}}"#,
     to: autoReviewSessionFile
 )
 assertTrue(

@@ -69,21 +69,34 @@ public final class CodexSessionMonitor {
 
     private struct TrackedSession {
         var id: String
+        var title: String?
         var workspace: String?
+        var approvalPolicy: String?
+        var approvalsReviewer: String?
         var activeTurnIDs: Set<String> = []
-        var state: SignalState = .idle
-        var reason: String = SignalReason.done
-        var message: String = "Idle"
+        var pendingInteractions: [String: PendingInteraction] = [:]
+        var state: SignalState = .unknown
+        var reason: String = SignalReason.sessionStart
+        var message: String = "Codex state has not been confirmed"
         var startedAt: Date?
         var updatedAt: Date = Date()
         var lastEmittedAt: Date?
         var blockedObservedAt: Date?
         var lastFileModificationDate: Date?
         var sessionFile: String?
+        var stateEvidence: String = "unconfirmed"
+        var stateCertainty: String = "unknown"
 
         var isActive: Bool {
             state.isActive && !activeTurnIDs.isEmpty
         }
+    }
+
+    private struct PendingInteraction {
+        var id: String
+        var reason: String
+        var message: String
+        var observedAt: Date
     }
 
     private struct FileCandidate {
@@ -102,6 +115,7 @@ public final class CodexSessionMonitor {
         var reason: String
         var message: String
         var timestamp: Date?
+        var interaction: PendingInteraction?
     }
 
     private struct SeedSummary {
@@ -111,6 +125,21 @@ public final class CodexSessionMonitor {
         var turnID: String?
         var startedAt: Date?
         var updatedAt: Date?
+        var interaction: PendingInteraction?
+        var approvalPolicy: String?
+        var approvalsReviewer: String?
+        var stateCertainty: String
+    }
+
+    private struct SeedScanState {
+        var lastActivity: SeedActivity?
+        var resolvedInteractionIDs: Set<String> = []
+        var unresolvedInteraction: PendingInteraction?
+        var approvalCandidate: PendingInteraction?
+        var activeTurnID: String?
+        var activeTurnStartedAt: Date?
+        var approvalPolicy: String?
+        var approvalsReviewer: String?
     }
 
     private let configuration: Configuration
@@ -185,7 +214,7 @@ public final class CodexSessionMonitor {
 
     private func poll(now: Date, forceDiscovery: Bool) {
         if forceDiscovery || shouldDiscover(now: now) {
-            discoverFiles(now: now)
+            discoverFiles(now: now, forceFullTree: forceDiscovery)
         }
 
         for key in Array(files.keys) {
@@ -205,9 +234,9 @@ public final class CodexSessionMonitor {
         return now.timeIntervalSince(lastDiscoveryAt) >= configuration.discoveryInterval
     }
 
-    private func discoverFiles(now: Date) {
+    private func discoverFiles(now: Date, forceFullTree: Bool) {
         lastDiscoveryAt = now
-        let needsFullDiscovery = shouldRunFullDiscovery(now: now)
+        let needsFullDiscovery = forceFullTree || shouldRunFullDiscovery(now: now)
         if needsFullDiscovery {
             lastFullDiscoveryAt = now
         }
@@ -278,8 +307,26 @@ public final class CodexSessionMonitor {
             }
         }
 
-        for key in Array(files.keys) where !selectedPaths.contains(key) && !isTrackedFileActive(files[key]) {
-            files.removeValue(forKey: key)
+        if needsFullDiscovery {
+            for key in Array(files.keys) where !selectedPaths.contains(key) && !isTrackedFileActive(files[key]) {
+                files.removeValue(forKey: key)
+            }
+        } else {
+            for key in Array(files.keys) where !selectedPaths.contains(key) {
+                guard var tracked = files[key],
+                      let attributes = fileAttributes(for: tracked.url) else {
+                    files.removeValue(forKey: key)
+                    continue
+                }
+
+                if tracked.knownSize != attributes.size
+                    || tracked.knownModificationDate != attributes.modifiedAt {
+                    tracked.knownSize = attributes.size
+                    tracked.knownModificationDate = attributes.modifiedAt
+                    tracked.hasUnprocessedChanges = true
+                    files[key] = tracked
+                }
+            }
         }
 
         pruneUntrackedIdleSessions(now: now)
@@ -441,36 +488,72 @@ public final class CodexSessionMonitor {
         guard let summary = finalSeedSummaryByScanningBackward(from: tracked.url, size: size) else {
             return false
         }
+        let recoveredTitle = latestTaskTitleByScanningBackward(from: tracked.url, size: size)
 
         let sessionID = currentSessionID(for: tracked)
         updateSession(sessionID) { session in
+            session.title = recoveredTitle ?? session.title
+            session.approvalPolicy = summary.approvalPolicy ?? session.approvalPolicy
+            session.approvalsReviewer = summary.approvalsReviewer
             switch summary.state {
             case .working:
                 session.activeTurnIDs = [summary.turnID ?? "unknown"]
+                session.pendingInteractions.removeAll()
                 session.state = .working
                 session.reason = summary.reason
                 session.message = summary.message
                 session.startedAt = summary.startedAt ?? summary.updatedAt ?? now
                 session.updatedAt = summary.updatedAt ?? summary.startedAt ?? now
                 session.blockedObservedAt = nil
+                session.stateEvidence = "session_replay"
+                session.stateCertainty = summary.stateCertainty
             case .idle:
                 session.activeTurnIDs.removeAll()
+                session.pendingInteractions.removeAll()
                 session.state = .idle
                 session.reason = summary.reason
                 session.message = summary.message
                 session.startedAt = nil
                 session.updatedAt = summary.updatedAt ?? now
                 session.blockedObservedAt = nil
+                session.stateEvidence = "session_replay"
+                session.stateCertainty = summary.stateCertainty
             case .blocked:
                 session.activeTurnIDs = [summary.turnID ?? "unknown"]
+                session.pendingInteractions.removeAll()
+                if let interaction = summary.interaction {
+                    session.pendingInteractions[interaction.id] = interaction
+                }
                 session.state = .blocked
                 session.reason = summary.reason
                 session.message = summary.message
-                session.startedAt = summary.startedAt ?? summary.updatedAt ?? now
+                session.startedAt = summary.updatedAt ?? summary.startedAt ?? now
                 session.updatedAt = summary.updatedAt ?? summary.startedAt ?? now
                 session.blockedObservedAt = now
-            default:
-                break
+                session.stateEvidence = "session_replay"
+                session.stateCertainty = summary.stateCertainty
+            case .error:
+                session.activeTurnIDs.removeAll()
+                session.pendingInteractions.removeAll()
+                session.state = .error
+                session.reason = summary.reason
+                session.message = summary.message
+                session.startedAt = nil
+                session.updatedAt = summary.updatedAt ?? now
+                session.blockedObservedAt = nil
+                session.stateEvidence = "session_replay"
+                session.stateCertainty = summary.stateCertainty
+            case .unknown:
+                session.activeTurnIDs.removeAll()
+                session.pendingInteractions.removeAll()
+                session.state = .unknown
+                session.reason = summary.reason
+                session.message = summary.message
+                session.startedAt = nil
+                session.updatedAt = summary.updatedAt ?? now
+                session.blockedObservedAt = nil
+                session.stateEvidence = "session_replay"
+                session.stateCertainty = summary.stateCertainty
             }
             session.sessionFile = tracked.url.path
         }
@@ -501,10 +584,22 @@ public final class CodexSessionMonitor {
                     session.updatedAt = record.timestamp ?? now
                     session.sessionFile = tracked.url.path
                 }
-            case .turnContext(_, let workspace):
+            case .turnContext(_, let workspace, let approvalPolicy, let approvalsReviewer):
                 let sessionID = currentSessionID(for: tracked)
                 updateSession(sessionID) { session in
                     session.workspace = workspace ?? session.workspace
+                    session.approvalPolicy = approvalPolicy ?? session.approvalPolicy
+                    session.approvalsReviewer = approvalsReviewer
+                    session.updatedAt = record.timestamp ?? now
+                    session.sessionFile = tracked.url.path
+                }
+            case .userPrompt(let prompt):
+                guard let title = taskTitle(from: prompt) else {
+                    continue
+                }
+                let sessionID = currentSessionID(for: tracked)
+                updateSession(sessionID) { session in
+                    session.title = title
                     session.updatedAt = record.timestamp ?? now
                     session.sessionFile = tracked.url.path
                 }
@@ -525,7 +620,7 @@ public final class CodexSessionMonitor {
         let chunkSize: UInt64 = 262_144
         var offset = size
         var leadingPartialLine = ""
-        var lastActivity: SeedActivity?
+        var scanState = SeedScanState()
 
         while offset > 0 {
             let chunkStart = offset > chunkSize ? offset - chunkSize : 0
@@ -550,7 +645,7 @@ public final class CodexSessionMonitor {
                 leadingPartialLine = ""
             }
 
-            if let summary = summarizeSeedLinesInReverse(lines, lastActivity: &lastActivity) {
+            if let summary = summarizeSeedLinesInReverse(lines, scanState: &scanState) {
                 return summary
             }
 
@@ -558,15 +653,17 @@ public final class CodexSessionMonitor {
         }
 
         if !leadingPartialLine.isEmpty {
-            return summarizeSeedLinesInReverse([leadingPartialLine], lastActivity: &lastActivity)
+            if let summary = summarizeSeedLinesInReverse([leadingPartialLine], scanState: &scanState) {
+                return summary
+            }
         }
 
-        return nil
+        return activeSeedSummary(from: scanState)
     }
 
     private func summarizeSeedLinesInReverse(
         _ lines: [String],
-        lastActivity: inout SeedActivity?
+        scanState: inout SeedScanState
     ) -> SeedSummary? {
         for line in lines.reversed() {
             let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -577,46 +674,188 @@ public final class CodexSessionMonitor {
 
             switch record.kind {
             case .taskEnded(_, let reason, let message):
+                if let active = activeSeedSummary(from: scanState) {
+                    return active
+                }
                 return SeedSummary(
                     state: .idle,
                     reason: reason,
                     message: message,
                     turnID: nil,
                     startedAt: nil,
-                    updatedAt: record.timestamp
+                    updatedAt: record.timestamp,
+                    interaction: nil,
+                    approvalPolicy: nil,
+                    approvalsReviewer: nil,
+                    stateCertainty: "verified"
+                )
+            case .taskFailed(_, let message):
+                if let active = activeSeedSummary(from: scanState) {
+                    return active
+                }
+                return SeedSummary(
+                    state: .error,
+                    reason: SignalReason.error,
+                    message: message,
+                    turnID: nil,
+                    startedAt: nil,
+                    updatedAt: record.timestamp,
+                    interaction: nil,
+                    approvalPolicy: nil,
+                    approvalsReviewer: nil,
+                    stateCertainty: "verified"
                 )
             case .taskStarted(let turnID):
-                return SeedSummary(
-                    state: lastActivity?.state ?? .working,
-                    reason: lastActivity?.reason ?? SignalReason.thinking,
-                    message: lastActivity?.message ?? "Codex is working",
-                    turnID: turnID,
-                    startedAt: record.timestamp,
-                    updatedAt: lastActivity?.timestamp ?? record.timestamp
-                )
-            case .blocked(let reason, let message):
-                if lastActivity == nil {
-                    lastActivity = SeedActivity(
-                        state: .blocked,
-                        reason: reason,
-                        message: message,
-                        timestamp: record.timestamp
-                    )
+                if scanState.activeTurnID != nil {
+                    return activeSeedSummary(from: scanState)
                 }
-            case .activity(let reason, let message):
-                if lastActivity == nil {
-                    lastActivity = SeedActivity(
+                scanState.activeTurnID = turnID ?? "unknown"
+                scanState.activeTurnStartedAt = record.timestamp
+            case .turnContext(let turnID, _, let approvalPolicy, let approvalsReviewer):
+                guard scanState.activeTurnID != nil else {
+                    continue
+                }
+                if let turnID,
+                   scanState.activeTurnID != "unknown",
+                   turnID != scanState.activeTurnID {
+                    continue
+                }
+                scanState.approvalPolicy = approvalPolicy
+                scanState.approvalsReviewer = approvalsReviewer
+                return activeSeedSummary(from: scanState)
+            case .blocked(let interactionID, let reason, let message):
+                guard !scanState.resolvedInteractionIDs.contains(interactionID),
+                      scanState.unresolvedInteraction == nil else {
+                    continue
+                }
+                scanState.unresolvedInteraction = PendingInteraction(
+                    id: interactionID,
+                    reason: reason,
+                    message: message,
+                    observedAt: record.timestamp ?? .distantPast
+                )
+            case .approvalCandidate(let interactionID, let message):
+                guard !scanState.resolvedInteractionIDs.contains(interactionID),
+                      scanState.approvalCandidate == nil else {
+                    continue
+                }
+                scanState.approvalCandidate = PendingInteraction(
+                    id: interactionID,
+                    reason: SignalReason.approval,
+                    message: message,
+                    observedAt: record.timestamp ?? .distantPast
+                )
+            case .activity(let resolvedInteractionID, let reason, let message):
+                if let resolvedInteractionID {
+                    scanState.resolvedInteractionIDs.insert(resolvedInteractionID)
+                }
+                if scanState.lastActivity == nil {
+                    scanState.lastActivity = SeedActivity(
                         state: .working,
                         reason: reason,
                         message: message,
-                        timestamp: record.timestamp
+                        timestamp: record.timestamp,
+                        interaction: nil
                     )
                 }
             default:
+                if scanState.activeTurnID != nil,
+                   case .sessionMeta = record.kind {
+                    return activeSeedSummary(from: scanState)
+                }
                 continue
             }
         }
 
+        return nil
+    }
+
+    private func activeSeedSummary(from scanState: SeedScanState) -> SeedSummary? {
+        guard let turnID = scanState.activeTurnID else {
+            return nil
+        }
+
+        var blocked = scanState.unresolvedInteraction
+        var stateCertainty = "verified"
+        if blocked == nil,
+           scanState.approvalsReviewer != "auto_review",
+           scanState.approvalPolicy != "never" {
+            blocked = scanState.approvalCandidate
+            if blocked != nil {
+                stateCertainty = "inferred"
+            }
+        }
+
+        return SeedSummary(
+            state: blocked == nil ? (scanState.lastActivity?.state ?? .working) : .blocked,
+            reason: blocked?.reason ?? scanState.lastActivity?.reason ?? SignalReason.thinking,
+            message: blocked?.message ?? scanState.lastActivity?.message ?? "Codex is working",
+            turnID: turnID,
+            startedAt: scanState.activeTurnStartedAt,
+            updatedAt: blocked?.observedAt
+                ?? scanState.lastActivity?.timestamp
+                ?? scanState.activeTurnStartedAt,
+            interaction: blocked,
+            approvalPolicy: scanState.approvalPolicy,
+            approvalsReviewer: scanState.approvalsReviewer,
+            stateCertainty: stateCertainty
+        )
+    }
+
+    private func latestTaskTitleByScanningBackward(from url: URL, size: UInt64) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return nil
+        }
+        defer {
+            try? handle.close()
+        }
+
+        let chunkSize: UInt64 = 262_144
+        var offset = size
+        var leadingPartialLine = ""
+
+        while offset > 0 {
+            let chunkStart = offset > chunkSize ? offset - chunkSize : 0
+            let length = offset - chunkStart
+            do {
+                try handle.seek(toOffset: chunkStart)
+            } catch {
+                return nil
+            }
+
+            let data = handle.readData(ofLength: Int(length))
+            guard !data.isEmpty else {
+                break
+            }
+
+            let text = String(decoding: data, as: UTF8.self) + leadingPartialLine
+            var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            if chunkStart > 0 {
+                leadingPartialLine = boundedPendingText(lines.isEmpty ? text : lines.removeFirst())
+            } else {
+                leadingPartialLine = ""
+            }
+
+            for line in lines.reversed() {
+                let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedLine.isEmpty,
+                      let record = parser.parse(trimmedLine),
+                      case .userPrompt(let prompt) = record.kind else {
+                    continue
+                }
+                if let title = taskTitle(from: prompt) {
+                    return title
+                }
+            }
+
+            offset = chunkStart
+        }
+
+        if !leadingPartialLine.isEmpty,
+           let record = parser.parse(leadingPartialLine),
+           case .userPrompt(let prompt) = record.kind {
+            return taskTitle(from: prompt)
+        }
         return nil
     }
 
@@ -723,10 +962,23 @@ public final class CodexSessionMonitor {
                 session.sessionFile = tracked.url.path
             }
 
-        case .turnContext(_, let workspace):
+        case .turnContext(_, let workspace, let approvalPolicy, let approvalsReviewer):
             let sessionID = currentSessionID(for: tracked)
             updateSession(sessionID) { session in
                 session.workspace = workspace ?? session.workspace
+                session.approvalPolicy = approvalPolicy ?? session.approvalPolicy
+                session.approvalsReviewer = approvalsReviewer
+                session.updatedAt = record.timestamp ?? now
+                session.sessionFile = tracked.url.path
+            }
+
+        case .userPrompt(let prompt):
+            guard let title = taskTitle(from: prompt) else {
+                return
+            }
+            let sessionID = currentSessionID(for: tracked)
+            updateSession(sessionID) { session in
+                session.title = title
                 session.updatedAt = record.timestamp ?? now
                 session.sessionFile = tracked.url.path
             }
@@ -736,50 +988,136 @@ public final class CodexSessionMonitor {
             let normalizedTurnID = turnID ?? "unknown"
             var shouldEmit = false
             updateSession(sessionID) { session in
+                let startsNewWorkingState = session.state != .working || session.activeTurnIDs.isEmpty
                 session.activeTurnIDs.insert(normalizedTurnID)
+                session.pendingInteractions.removeAll()
                 session.state = .working
                 session.reason = SignalReason.thinking
                 session.message = "Codex is working"
-                session.startedAt = session.startedAt ?? (record.timestamp ?? now)
+                if startsNewWorkingState {
+                    session.startedAt = record.timestamp ?? now
+                }
                 session.updatedAt = record.timestamp ?? now
                 session.blockedObservedAt = nil
                 session.sessionFile = tracked.url.path
+                session.stateEvidence = "task_started"
+                session.stateCertainty = "verified"
                 shouldEmit = true
             }
             if emitPolicy == .live, shouldEmit {
                 emitSession(sessionID, now: now)
             }
 
-        case .blocked(let reason, let message):
+        case .blocked(let interactionID, let reason, let message):
             let sessionID = currentSessionID(for: tracked)
             guard sessions[sessionID]?.isActive == true else {
                 return
             }
 
             updateSession(sessionID) { session in
+                if session.state != .blocked {
+                    session.startedAt = record.timestamp ?? now
+                }
+                let observedAt = record.timestamp ?? now
+                session.pendingInteractions[interactionID] = PendingInteraction(
+                    id: interactionID,
+                    reason: reason,
+                    message: message,
+                    observedAt: observedAt
+                )
                 session.state = .blocked
                 session.reason = reason
                 session.message = message
-                session.updatedAt = record.timestamp ?? now
+                session.updatedAt = observedAt
                 session.blockedObservedAt = session.blockedObservedAt ?? now
                 session.sessionFile = tracked.url.path
+                session.stateEvidence = "interaction_request"
+                session.stateCertainty = "verified"
             }
 
-        case .activity(let reason, let message):
+        case .approvalCandidate(let interactionID, let message):
             let sessionID = currentSessionID(for: tracked)
             guard sessions[sessionID]?.isActive == true else {
                 return
             }
 
+            var shouldEmit = false
             updateSession(sessionID) { session in
+                let usesAutomaticReviewer = session.approvalsReviewer == "auto_review"
+                let approvalDisabled = session.approvalPolicy == "never"
+                if usesAutomaticReviewer || approvalDisabled {
+                    session.pendingInteractions.removeValue(forKey: interactionID)
+                    session.state = .working
+                    session.reason = SignalReason.command
+                    session.message = usesAutomaticReviewer
+                        ? "Automatic reviewer is checking permission"
+                        : "Processing command permission"
+                    session.updatedAt = record.timestamp ?? now
+                    session.blockedObservedAt = nil
+                    session.sessionFile = tracked.url.path
+                    session.stateEvidence = "turn_context"
+                    session.stateCertainty = "verified"
+                    shouldEmit = true
+                    return
+                }
+
+                let observedAt = record.timestamp ?? now
+                session.pendingInteractions[interactionID] = PendingInteraction(
+                    id: interactionID,
+                    reason: SignalReason.approval,
+                    message: message,
+                    observedAt: observedAt
+                )
+                session.state = .blocked
+                session.reason = SignalReason.approval
+                session.message = message
+                session.updatedAt = observedAt
+                session.blockedObservedAt = session.blockedObservedAt ?? now
+                session.sessionFile = tracked.url.path
+                session.stateEvidence = "approval_inference"
+                session.stateCertainty = "inferred"
+            }
+            if emitPolicy == .live, shouldEmit {
+                emitSession(sessionID, now: now)
+            }
+
+        case .activity(let resolvedInteractionID, let reason, let message):
+            let sessionID = currentSessionID(for: tracked)
+            guard sessions[sessionID]?.isActive == true else {
+                return
+            }
+
+            var shouldEmit = false
+            updateSession(sessionID) { session in
+                if let resolvedInteractionID {
+                    session.pendingInteractions.removeValue(forKey: resolvedInteractionID)
+                }
+
+                guard session.pendingInteractions.isEmpty else {
+                    if let pending = session.pendingInteractions.values.max(by: { $0.observedAt < $1.observedAt }) {
+                        session.state = .blocked
+                        session.reason = pending.reason
+                        session.message = pending.message
+                    }
+                    session.updatedAt = record.timestamp ?? now
+                    session.sessionFile = tracked.url.path
+                    return
+                }
+
+                if session.state != .working {
+                    session.startedAt = record.timestamp ?? now
+                }
                 session.state = .working
                 session.reason = reason
                 session.message = message
                 session.updatedAt = record.timestamp ?? now
                 session.blockedObservedAt = nil
                 session.sessionFile = tracked.url.path
+                session.stateEvidence = "activity_event"
+                session.stateCertainty = "verified"
+                shouldEmit = true
             }
-            if emitPolicy == .live {
+            if emitPolicy == .live, shouldEmit {
                 emitSession(sessionID, now: now)
             }
 
@@ -793,15 +1131,41 @@ public final class CodexSessionMonitor {
                 }
 
                 if session.activeTurnIDs.isEmpty {
+                    session.pendingInteractions.removeAll()
                     session.state = .idle
                     session.reason = reason
                     session.message = message
                     session.startedAt = nil
                     session.blockedObservedAt = nil
+                    session.stateEvidence = "task_complete"
+                    session.stateCertainty = "verified"
                 }
 
                 session.updatedAt = record.timestamp ?? now
                 session.sessionFile = tracked.url.path
+            }
+            if emitPolicy == .live {
+                emitSession(sessionID, now: now)
+            }
+
+        case .taskFailed(let turnID, let message):
+            let sessionID = currentSessionID(for: tracked)
+            updateSession(sessionID) { session in
+                if let turnID {
+                    session.activeTurnIDs.remove(turnID)
+                } else {
+                    session.activeTurnIDs.removeAll()
+                }
+                session.pendingInteractions.removeAll()
+                session.state = .error
+                session.reason = SignalReason.error
+                session.message = message
+                session.startedAt = nil
+                session.updatedAt = record.timestamp ?? now
+                session.blockedObservedAt = nil
+                session.sessionFile = tracked.url.path
+                session.stateEvidence = "error_event"
+                session.stateCertainty = "verified"
             }
             if emitPolicy == .live {
                 emitSession(sessionID, now: now)
@@ -845,12 +1209,15 @@ public final class CodexSessionMonitor {
             if isStale(session, now: now) {
                 updateSession(sessionID) { session in
                     session.activeTurnIDs.removeAll()
-                    session.state = .idle
+                    session.pendingInteractions.removeAll()
+                    session.state = .unknown
                     session.reason = SignalReason.stale
-                    session.message = "Codex activity went stale"
+                    session.message = "Codex state could not be confirmed"
                     session.startedAt = nil
                     session.blockedObservedAt = nil
                     session.updatedAt = now
+                    session.stateEvidence = "stale_timeout"
+                    session.stateCertainty = "unknown"
                 }
                 emitSession(sessionID, now: now, force: true)
                 continue
@@ -900,11 +1267,22 @@ public final class CodexSessionMonitor {
         if let sessionFile = session.sessionFile {
             metadata["session_file"] = .string(sessionFile)
         }
+        metadata["jump_url"] = .string("codex://threads/\(session.id)")
+        metadata["host_bundle_id"] = .string("com.openai.codex")
+        metadata["state_evidence"] = .string(session.stateEvidence)
+        metadata["state_certainty"] = .string(session.stateCertainty)
+        if let approvalPolicy = session.approvalPolicy {
+            metadata["approval_policy"] = .string(approvalPolicy)
+        }
+        if let approvalsReviewer = session.approvalsReviewer {
+            metadata["approvals_reviewer"] = .string(approvalsReviewer)
+        }
 
         return SignalEvent(
             source: "codex",
             adapter: "codex-session-monitor",
             sessionId: session.id,
+            title: session.title,
             workspace: session.workspace,
             state: session.state,
             reason: session.reason,
@@ -948,6 +1326,43 @@ public final class CodexSessionMonitor {
         var session = sessions[sessionID] ?? TrackedSession(id: sessionID)
         update(&session)
         sessions[sessionID] = session
+    }
+
+    private func taskTitle(from prompt: String) -> String? {
+        var candidate = prompt
+        for marker in ["## My request for Codex:", "## My request:"] {
+            if let range = candidate.range(of: marker, options: .backwards) {
+                candidate = String(candidate[range.upperBound...])
+                break
+            }
+        }
+
+        candidate = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ignoredPrefixes = [
+            "<app-context>",
+            "<environment_context>",
+            "<permissions instructions>",
+            "# AGENTS.md instructions"
+        ]
+        if ignoredPrefixes.contains(where: { candidate.hasPrefix($0) }) {
+            return nil
+        }
+
+        candidate = candidate.trimmingCharacters(
+            in: CharacterSet(charactersIn: "#*- \t\r\n")
+        )
+        let collapsed = candidate
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        guard !collapsed.isEmpty else {
+            return nil
+        }
+
+        let maximumLength = 72
+        if collapsed.count > maximumLength {
+            return String(collapsed.prefix(maximumLength - 1)) + "…"
+        }
+        return collapsed
     }
 
     private func isTrackedFileActive(_ tracked: TrackedFile?) -> Bool {
@@ -1044,11 +1459,19 @@ public final class CodexSessionMonitor {
 private struct CodexSessionRecord {
     enum Kind {
         case sessionMeta(id: String, workspace: String?)
-        case turnContext(turnID: String?, workspace: String?)
+        case turnContext(
+            turnID: String?,
+            workspace: String?,
+            approvalPolicy: String?,
+            approvalsReviewer: String?
+        )
+        case userPrompt(String)
         case taskStarted(turnID: String?)
-        case blocked(reason: String, message: String)
-        case activity(reason: String, message: String)
+        case blocked(interactionID: String, reason: String, message: String)
+        case approvalCandidate(interactionID: String, message: String)
+        case activity(resolvedInteractionID: String?, reason: String, message: String)
         case taskEnded(turnID: String?, reason: String, message: String)
+        case taskFailed(turnID: String?, message: String)
         case ignored
     }
 
@@ -1093,7 +1516,9 @@ private final class CodexSessionLineParser {
                 timestamp: timestamp,
                 kind: .turnContext(
                     turnID: payload?["turn_id"] as? String,
-                    workspace: payload?["cwd"] as? String
+                    workspace: payload?["cwd"] as? String,
+                    approvalPolicy: payload?["approval_policy"] as? String,
+                    approvalsReviewer: payload?["approvals_reviewer"] as? String
                 )
             )
 
@@ -1109,17 +1534,27 @@ private final class CodexSessionLineParser {
     }
 
     private func mightContainRelevantRecord(_ line: String) -> Bool {
-        line.contains(#""type":"session_meta""#)
-            || line.contains(#""type":"turn_context""#)
-            || line.contains(#""type":"task_started""#)
-            || line.contains(#""type":"task_complete""#)
-            || line.contains(#""type":"turn_aborted""#)
-            || line.contains(#""type":"web_search_end""#)
-            || line.contains(#""type":"web_search_call""#)
-            || line.contains(#""type":"function_call""#)
-            || line.contains(#""type":"function_call_output""#)
-            || line.contains(#""sandbox_permissions":"require_escalated""#)
-            || line.contains(#""name":"request_user_input""#)
+        let relevantTypes = [
+            "session_meta", "turn_context", "user_message",
+            "task_started", "turn_started", "task_complete", "turn_complete", "turn_aborted",
+            "exec_approval_request", "apply_patch_approval_request", "request_permissions",
+            "request_user_input", "elicitation_request", "mcp_elicitation_request",
+            "error", "warning", "stream_error",
+            "exec_command_begin", "exec_command_end", "patch_apply_begin", "patch_apply_end",
+            "mcp_tool_call_begin", "mcp_tool_call_end", "web_search_begin", "web_search_end",
+            "image_generation_begin", "image_generation_end",
+            "dynamic_tool_call_request", "dynamic_tool_call_response",
+            "web_search_call", "function_call", "function_call_output",
+            "custom_tool_call", "custom_tool_call_output", "local_shell_call"
+        ]
+
+        return relevantTypes.contains(where: { serializedType($0, appearsIn: line) })
+            || line.contains(#""role":"user""#)
+            || line.contains(#""role": "user""#)
+    }
+
+    private func serializedType(_ type: String, appearsIn line: String) -> Bool {
+        line.contains(#""type":"\#(type)""#) || line.contains(#""type": "\#(type)""#)
     }
 
     private func parseEventMessage(payload: [String: Any]?, timestamp: Date?) -> CodexSessionRecord {
@@ -1129,13 +1564,28 @@ private final class CodexSessionLineParser {
         }
 
         switch payloadType {
-        case "task_started":
+        case "user_message":
+            guard let message = (payload["message"] as? String) ?? (payload["text"] as? String) else {
+                return CodexSessionRecord(timestamp: timestamp, kind: .ignored)
+            }
+            return CodexSessionRecord(timestamp: timestamp, kind: .userPrompt(message))
+
+        case "task_started", "turn_started":
             return CodexSessionRecord(
                 timestamp: timestamp,
                 kind: .taskStarted(turnID: payload["turn_id"] as? String)
             )
 
-        case "task_complete":
+        case "task_complete", "turn_complete":
+            if let error = payload["error"] as? [String: Any] {
+                return CodexSessionRecord(
+                    timestamp: timestamp,
+                    kind: .taskFailed(
+                        turnID: payload["turn_id"] as? String,
+                        message: (error["message"] as? String) ?? "Codex turn failed"
+                    )
+                )
+            }
             return CodexSessionRecord(
                 timestamp: timestamp,
                 kind: .taskEnded(
@@ -1150,15 +1600,151 @@ private final class CodexSessionLineParser {
                 timestamp: timestamp,
                 kind: .taskEnded(
                     turnID: payload["turn_id"] as? String,
-                    reason: SignalReason.done,
+                    reason: SignalReason.interrupted,
                     message: "Turn interrupted"
                 )
             )
 
-        case "web_search_end":
+        case "exec_approval_request":
             return CodexSessionRecord(
                 timestamp: timestamp,
-                kind: .activity(reason: SignalReason.tool, message: "Searching the web")
+                kind: .blocked(
+                    interactionID: interactionID(payload: payload, eventType: payloadType),
+                    reason: SignalReason.approval,
+                    message: "Waiting for command approval"
+                )
+            )
+
+        case "apply_patch_approval_request":
+            return CodexSessionRecord(
+                timestamp: timestamp,
+                kind: .blocked(
+                    interactionID: interactionID(payload: payload, eventType: payloadType),
+                    reason: SignalReason.approval,
+                    message: "Waiting for file-change approval"
+                )
+            )
+
+        case "request_permissions":
+            return CodexSessionRecord(
+                timestamp: timestamp,
+                kind: .blocked(
+                    interactionID: interactionID(payload: payload, eventType: payloadType),
+                    reason: SignalReason.approval,
+                    message: "Waiting for permission approval"
+                )
+            )
+
+        case "request_user_input":
+            let isBlocking = (payload["isBlocking"] as? Bool)
+                ?? (payload["is_blocking"] as? Bool)
+                ?? true
+            if !isBlocking {
+                return CodexSessionRecord(
+                    timestamp: timestamp,
+                    kind: .activity(
+                        resolvedInteractionID: nil,
+                        reason: SignalReason.tool,
+                        message: "Processing optional input"
+                    )
+                )
+            }
+            return CodexSessionRecord(
+                timestamp: timestamp,
+                kind: .blocked(
+                    interactionID: interactionID(payload: payload, eventType: payloadType),
+                    reason: SignalReason.question,
+                    message: "Waiting for user response"
+                )
+            )
+
+        case "elicitation_request", "mcp_elicitation_request":
+            return CodexSessionRecord(
+                timestamp: timestamp,
+                kind: .blocked(
+                    interactionID: interactionID(payload: payload, eventType: payloadType),
+                    reason: SignalReason.question,
+                    message: "Waiting for connector response"
+                )
+            )
+
+        case "error":
+            guard errorAffectsTurnStatus(payload: payload) else {
+                return CodexSessionRecord(timestamp: timestamp, kind: .ignored)
+            }
+            return CodexSessionRecord(
+                timestamp: timestamp,
+                kind: .taskFailed(
+                    turnID: payload["turn_id"] as? String,
+                    message: (payload["message"] as? String) ?? "Codex reported an error"
+                )
+            )
+
+        case "warning", "stream_error":
+            return CodexSessionRecord(timestamp: timestamp, kind: .ignored)
+
+        case "exec_command_begin":
+            return activityRecord(
+                payload: payload,
+                timestamp: timestamp,
+                reason: SignalReason.command,
+                message: "Running command"
+            )
+
+        case "patch_apply_begin":
+            return activityRecord(
+                payload: payload,
+                timestamp: timestamp,
+                reason: SignalReason.fileChange,
+                message: "Applying file changes"
+            )
+
+        case "mcp_tool_call_begin", "dynamic_tool_call_request":
+            return activityRecord(
+                payload: payload,
+                timestamp: timestamp,
+                reason: SignalReason.tool,
+                message: "Running tool"
+            )
+
+        case "web_search_begin", "web_search_end":
+            return activityRecord(
+                payload: payload,
+                timestamp: timestamp,
+                reason: SignalReason.tool,
+                message: "Searching the web"
+            )
+
+        case "image_generation_begin", "image_generation_end":
+            return activityRecord(
+                payload: payload,
+                timestamp: timestamp,
+                reason: SignalReason.tool,
+                message: "Generating image"
+            )
+
+        case "exec_command_end":
+            return activityRecord(
+                payload: payload,
+                timestamp: timestamp,
+                reason: SignalReason.command,
+                message: "Processing command result"
+            )
+
+        case "patch_apply_end":
+            return activityRecord(
+                payload: payload,
+                timestamp: timestamp,
+                reason: SignalReason.fileChange,
+                message: "Processing file changes"
+            )
+
+        case "mcp_tool_call_end", "dynamic_tool_call_response":
+            return activityRecord(
+                payload: payload,
+                timestamp: timestamp,
+                reason: SignalReason.tool,
+                message: "Processing tool result"
             )
 
         default:
@@ -1173,41 +1759,123 @@ private final class CodexSessionLineParser {
         }
 
         switch payloadType {
+        case "message":
+            guard payload["role"] as? String == "user",
+                  let content = payload["content"] as? [[String: Any]],
+                  let message = content.compactMap({ item -> String? in
+                      guard let type = item["type"] as? String,
+                            type == "input_text" || type == "text" else {
+                          return nil
+                      }
+                      return item["text"] as? String
+                  }).first else {
+                return CodexSessionRecord(timestamp: timestamp, kind: .ignored)
+            }
+            return CodexSessionRecord(timestamp: timestamp, kind: .userPrompt(message))
+
         case "web_search_call":
             return CodexSessionRecord(
                 timestamp: timestamp,
-                kind: .activity(reason: SignalReason.tool, message: "Searching the web")
+                kind: .activity(
+                    resolvedInteractionID: identifier(in: payload, keys: ["call_id"]),
+                    reason: SignalReason.tool,
+                    message: "Searching the web"
+                )
             )
 
         case "function_call":
             let name = payload["name"] as? String
             if name == "request_user_input" {
+                let arguments = decodedArguments(from: payload)
+                let isBlocking = (arguments?["isBlocking"] as? Bool)
+                    ?? (arguments?["is_blocking"] as? Bool)
+                    ?? true
+                if !isBlocking {
+                    return CodexSessionRecord(
+                        timestamp: timestamp,
+                        kind: .activity(
+                            resolvedInteractionID: nil,
+                            reason: SignalReason.tool,
+                            message: "Processing optional input"
+                        )
+                    )
+                }
                 return CodexSessionRecord(
                     timestamp: timestamp,
-                    kind: .blocked(reason: SignalReason.question, message: "Waiting for user response")
+                    kind: .blocked(
+                        interactionID: interactionID(payload: payload, eventType: "request_user_input"),
+                        reason: SignalReason.question,
+                        message: "Waiting for user response"
+                    )
                 )
             }
             if name == "exec_command" {
                 if requiresEscalatedApproval(payload: payload) {
                     return CodexSessionRecord(
                         timestamp: timestamp,
-                        kind: .blocked(reason: SignalReason.approval, message: "Waiting for command approval")
+                        kind: .approvalCandidate(
+                            interactionID: interactionID(payload: payload, eventType: "exec_approval_request"),
+                            message: "Waiting for command approval"
+                        )
                     )
                 }
                 return CodexSessionRecord(
                     timestamp: timestamp,
-                    kind: .activity(reason: SignalReason.command, message: "Running command")
+                    kind: .activity(
+                        resolvedInteractionID: nil,
+                        reason: SignalReason.command,
+                        message: "Running command"
+                    )
                 )
             }
             return CodexSessionRecord(
                 timestamp: timestamp,
-                kind: .activity(reason: SignalReason.tool, message: "Running tool")
+                kind: .activity(
+                    resolvedInteractionID: nil,
+                    reason: SignalReason.tool,
+                    message: "Running tool"
+                )
             )
 
         case "function_call_output":
             return CodexSessionRecord(
                 timestamp: timestamp,
-                kind: .activity(reason: SignalReason.tool, message: "Processing tool result")
+                kind: .activity(
+                    resolvedInteractionID: identifier(in: payload, keys: ["call_id"]),
+                    reason: SignalReason.tool,
+                    message: "Processing tool result"
+                )
+            )
+
+        case "custom_tool_call", "local_shell_call":
+            let name = (payload["name"] as? String) ?? ""
+            let isCommand = name == "exec" || name == "exec_command" || payloadType == "local_shell_call"
+            if isCommand, customToolRequiresEscalatedApproval(payload: payload) {
+                return CodexSessionRecord(
+                    timestamp: timestamp,
+                    kind: .approvalCandidate(
+                        interactionID: interactionID(payload: payload, eventType: "exec_approval_request"),
+                        message: "Waiting for command approval"
+                    )
+                )
+            }
+            return CodexSessionRecord(
+                timestamp: timestamp,
+                kind: .activity(
+                    resolvedInteractionID: nil,
+                    reason: isCommand ? SignalReason.command : SignalReason.tool,
+                    message: isCommand ? "Running command" : "Running tool"
+                )
+            )
+
+        case "custom_tool_call_output":
+            return CodexSessionRecord(
+                timestamp: timestamp,
+                kind: .activity(
+                    resolvedInteractionID: identifier(in: payload, keys: ["call_id"]),
+                    reason: SignalReason.tool,
+                    message: "Processing tool result"
+                )
             )
 
         default:
@@ -1231,5 +1899,70 @@ private final class CodexSessionLineParser {
         }
 
         return object["sandbox_permissions"] as? String == "require_escalated"
+    }
+
+    private func customToolRequiresEscalatedApproval(payload: [String: Any]) -> Bool {
+        guard let input = payload["input"] as? String else {
+            return false
+        }
+        return input.contains("sandbox_permissions") && input.contains("require_escalated")
+    }
+
+    private func errorAffectsTurnStatus(payload: [String: Any]) -> Bool {
+        guard let info = payload["codex_error_info"] else {
+            return true
+        }
+        let nonTerminalTypes = ["thread_rollback_failed", "active_turn_not_steerable"]
+        if let type = info as? String {
+            return !nonTerminalTypes.contains(type)
+        }
+        if let object = info as? [String: Any] {
+            return object.keys.allSatisfy { !nonTerminalTypes.contains($0) }
+        }
+        return true
+    }
+
+    private func activityRecord(
+        payload: [String: Any],
+        timestamp: Date?,
+        reason: String,
+        message: String
+    ) -> CodexSessionRecord {
+        CodexSessionRecord(
+            timestamp: timestamp,
+            kind: .activity(
+                resolvedInteractionID: identifier(in: payload, keys: ["call_id", "id"]),
+                reason: reason,
+                message: message
+            )
+        )
+    }
+
+    private func interactionID(payload: [String: Any], eventType: String) -> String {
+        identifier(in: payload, keys: ["call_id", "id", "request_id", "approval_id"])
+            ?? "\(eventType):\((payload["turn_id"] as? String) ?? "unknown")"
+    }
+
+    private func identifier(in payload: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = payload[key] as? String, !value.isEmpty {
+                return value
+            }
+            if let value = payload[key] as? NSNumber {
+                return value.stringValue
+            }
+        }
+        return nil
+    }
+
+    private func decodedArguments(from payload: [String: Any]) -> [String: Any]? {
+        if let arguments = payload["arguments"] as? [String: Any] {
+            return arguments
+        }
+        guard let arguments = payload["arguments"] as? String,
+              let data = arguments.data(using: .utf8) else {
+            return nil
+        }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 }

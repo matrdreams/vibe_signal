@@ -44,6 +44,8 @@ struct VibeSignalCLI {
                 try demo(arguments)
             case "codex-notify":
                 try codexNotify(arguments)
+            case "codex-hook":
+                codexHook(arguments)
             case "help", "-h", "--help":
                 printHelp()
             default:
@@ -87,17 +89,24 @@ struct VibeSignalCLI {
         let sessionId = try parser.optionalValue(for: "--session-id")
             ?? ProcessInfo.processInfo.environment["VIBE_SIGNAL_SESSION_ID"]
             ?? ProcessInfo.processInfo.environment["CODEX_SESSION_ID"]
+            ?? ProcessInfo.processInfo.environment["CODEX_THREAD_ID"]
             ?? stableSessionId(source: source, workspace: workspace)
 
         let reason = try parser.optionalValue(for: "--reason") ?? defaultReason(for: state)
         let ttlMs = try parser.optionalValue(for: "--ttl-ms").flatMap(Int.init)
             ?? defaultTTL(for: state)
-        let metadata = try parseMetadata(parser.values(for: "--metadata"))
+        let title = try parser.optionalValue(for: "--title")
+            ?? ProcessInfo.processInfo.environment["VIBE_SIGNAL_TITLE"]
+        var metadata = try parseMetadata(parser.values(for: "--metadata"))
+        for (key, value) in navigationMetadata() where metadata[key] == nil {
+            metadata[key] = value
+        }
 
         let event = SignalEvent(
             source: source,
             adapter: adapter,
             sessionId: sessionId,
+            title: title,
             workspace: workspace,
             state: state,
             reason: reason,
@@ -123,9 +132,10 @@ struct VibeSignalCLI {
         }
 
         for event in snapshot.sessions {
+            let title = event.title ?? "-"
             let workspace = event.workspace.map(workspaceName) ?? "-"
             let message = event.message ?? event.reason
-            print("\(event.state.rawValue)\t\(workspace)\t\(message)\t\(event.sessionKey)")
+            print("\(event.state.rawValue)\t\(title)\t\(workspace)\t\(message)\t\(event.sessionKey)")
         }
     }
 
@@ -177,11 +187,14 @@ struct VibeSignalCLI {
             ?? ProcessInfo.processInfo.environment["PWD"]
             ?? FileManager.default.currentDirectoryPath
         let sessionId = ProcessInfo.processInfo.environment["CODEX_SESSION_ID"]
+            ?? ProcessInfo.processInfo.environment["CODEX_THREAD_ID"]
             ?? ProcessInfo.processInfo.environment["VIBE_SIGNAL_SESSION_ID"]
             ?? stableSessionId(source: "codex", workspace: workspace)
 
         var metadata: [String: JSONValue] = [
-            "event": .string(eventName)
+            "event": .string(eventName),
+            "jump_url": .string("codex://threads/\(sessionId)"),
+            "host_bundle_id": .string("com.openai.codex")
         ]
         if !arguments.isEmpty {
             metadata["argv"] = .array(arguments.map { .string($0) })
@@ -191,6 +204,7 @@ struct VibeSignalCLI {
             source: "codex",
             adapter: "codex-notify",
             sessionId: sessionId,
+            title: ProcessInfo.processInfo.environment["VIBE_SIGNAL_TITLE"],
             workspace: workspace,
             state: mapping.state,
             reason: mapping.reason,
@@ -202,6 +216,19 @@ struct VibeSignalCLI {
         )
 
         try sendOrPersist(event)
+    }
+
+    private static func codexHook(_ arguments: [String]) {
+        _ = arguments
+        let data = FileHandle.standardInput.readDataToEndOfFile()
+        guard !data.isEmpty,
+              let event = try? CodexHookBridge.makeEvent(from: data) else {
+            return
+        }
+
+        // Lifecycle hooks must never delay or break Codex. If the app is not
+        // running, the rollout monitor will reconstruct state on next launch.
+        try? UnixSocketClient.send(event: event)
     }
 
     private static func sendOrPersist(_ event: SignalEvent, allowOffline: Bool = true) throws {
@@ -292,6 +319,22 @@ struct VibeSignalCLI {
         return metadata
     }
 
+    private static func navigationMetadata() -> [String: JSONValue] {
+        let environment = ProcessInfo.processInfo.environment
+        var metadata: [String: JSONValue] = [:]
+        if let jumpURL = environment["VIBE_SIGNAL_JUMP_URL"] {
+            metadata["jump_url"] = .string(jumpURL)
+        }
+        if let bundleIdentifier = environment["VIBE_SIGNAL_HOST_BUNDLE_ID"] {
+            metadata["host_bundle_id"] = .string(bundleIdentifier)
+        }
+        if let processIdentifier = environment["VIBE_SIGNAL_HOST_PID"],
+           let value = Double(processIdentifier) {
+            metadata["host_pid"] = .number(value)
+        }
+        return metadata
+    }
+
     private static func stableSessionId(source: String, workspace: String) -> String {
         var hash: UInt64 = 14_695_981_039_346_656_037
         for byte in "\(source):\(workspace)".utf8 {
@@ -311,11 +354,12 @@ struct VibeSignalCLI {
         Vibe Signal
 
         Usage:
-          vibe-signal emit --state blocked --reason approval --message "Waiting for approval"
+          vibe-signal emit --state blocked --title "Fix login" --reason approval --message "Waiting for approval"
           vibe-signal emit --json '{"schemaVersion":1,...}'
           vibe-signal emit --require-hub --state working
           vibe-signal demo working
           vibe-signal codex-notify turn-ended
+          vibe-signal codex-hook < hook-event.json
           vibe-signal ping
           vibe-signal status
           vibe-signal paths
