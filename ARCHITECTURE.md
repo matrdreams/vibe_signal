@@ -28,8 +28,8 @@
 | 状态 Hub | Swift 或 Go | 负责接收各类 agent 状态，归约成全局状态 |
 | 本地 IPC | Unix domain socket + JSONL | 简单、稳定、适合本机进程通信 |
 | 状态快照 | 原子 JSON 文件，后续可升级 SQLite | 方便菜单栏 app 启动时恢复最后状态 |
-| Codex 普通 CLI 支持 | Codex hooks adapter | 稳定、适配用户直接在终端运行 `codex` 的习惯 |
-| Codex 精确状态支持 | Codex app-server bridge，可选增强 | 更高保真，但作为增强 adapter，不作为唯一依赖 |
+| Codex 普通 CLI/Desktop 支持 | 只读 session monitor + 可选 lifecycle hooks | 不改变用户启动习惯 |
+| Codex 精确状态支持 | 官方事件语义 + call ID 关联 + fail-closed | app-server 仅在未来可安全 attach 时增强 |
 | 开机启动 | `SMAppService` | macOS 13+ 官方 Login Item 方案 |
 | 自动更新 | Sparkle，可选 | 非 Mac App Store 分发时使用 |
 
@@ -38,8 +38,8 @@
 
 当前更推荐的路线是：
 
-1. 第一阶段实现 `Codex hooks adapter + local status hub + Swift menu bar app`。
-2. 第二阶段增加 `Codex app-server bridge`，提高 waiting/user input/thread 状态准确性。
+1. 第一阶段实现 `只读 Codex session monitor + 可选 lifecycle hooks + local status hub + Swift menu bar app`。
+2. Codex 将来若提供可附着到既有 Desktop 进程的受支持事件端点，再增加无接管的 `app-server bridge`。
 3. 第三阶段开放通用 CLI/API，支持更多 agent。
 
 ## 3. 架构总览
@@ -112,6 +112,7 @@ unknown  -> 灰色
   "source": "codex",
   "adapter": "codex-hooks",
   "sessionId": "session-abc",
+  "title": "Fix login on macOS",
   "workspace": "/Users/kun/Code/example",
   "state": "blocked",
   "reason": "approval",
@@ -122,7 +123,9 @@ unknown  -> 灰色
   "metadata": {
     "model": "gpt-5.4",
     "turnId": "turn-123",
-    "toolName": "Bash"
+    "toolName": "Bash",
+    "jump_url": "codex://threads/session-abc",
+    "host_bundle_id": "com.openai.codex"
   }
 }
 ```
@@ -135,6 +138,7 @@ unknown  -> 灰色
 | `source` | 是 | agent 来源，例如 `codex`、`claude`、`aider` |
 | `adapter` | 是 | 具体适配器，例如 `codex-hooks`、`codex-app-server` |
 | `sessionId` | 是 | 一个 agent 会话的稳定 ID |
+| `title` | 否 | 简短任务标题，用于菜单和通知 |
 | `workspace` | 否 | 工作目录，用于菜单展示 |
 | `state` | 是 | `blocked` / `working` / `idle` / `error` / `unknown` |
 | `reason` | 是 | 更细原因，例如 `approval`、`question`、`thinking`、`tool`、`done` |
@@ -142,7 +146,7 @@ unknown  -> 灰色
 | `startedAt` | 否 | 当前状态开始时间 |
 | `updatedAt` | 是 | 状态更新时间 |
 | `ttlMs` | 否 | 状态过期时间，防止异常退出后永久黄灯/红灯 |
-| `metadata` | 否 | source-specific 信息，UI 不强依赖 |
+| `metadata` | 否 | source-specific 信息；可用 `jump_url`、`host_pid`、`host_bundle_id` 提供会话跳转 |
 
 ### 4.3 状态原因枚举
 
@@ -158,7 +162,8 @@ unknown  -> 灰色
 | `file_change` | `working` | 正在修改文件 |
 | `review` | `working` | 自动审查或 approval review |
 | `done` | `idle` | turn 已结束 |
-| `session_start` | `idle` 或 `working` | 会话开始 |
+| `session_start` | `unknown` | 只确认会话存在，尚不能证明空闲或工作中 |
+| `interrupted` | `idle` | turn 已中断，Codex 已可接受下一次输入 |
 | `error` | `error` | adapter 或 agent 出错 |
 | `stale` | `unknown` | 状态过期 |
 
@@ -169,16 +174,17 @@ Hub 需要维护所有 session 的最新状态，然后归约成一个菜单栏�
 优先级：
 
 ```text
-blocked > error > working > idle > unknown
+blocked > error > unknown > working > idle
 ```
 
 建议规则：
 
 1. 只考虑未过期 session。
 2. 任意 session 为 `blocked`，全局状态就是红色。
-3. 没有 blocked，但任意 session 为 `working`，全局状态就是黄色。
-4. 所有有效 session 都是 `idle`，全局状态就是绿色。
-5. 没有有效 session，则显示灰色或绿色。产品体验上建议灰色表示“没有观测到 Codex”。
+3. 没有 blocked/error，但任意 session 无法验证时，全局状态为灰色；不能用一个已知 working/idle 掩盖另一个未知 session。
+4. 所有 session 都可验证，且至少一个为 `working` 时，全局状态为黄色。
+5. 所有有效 session 都是已确认的 `idle` 时，全局状态才是绿色。
+6. 没有有效 session 时显示灰色，绝不从“没有事件”推断绿色。
 
 菜单栏图标只显示聚合状态颜色，不在图标旁显示数字。点击信号灯后，下拉菜单展示当前活跃 session 列表：
 
@@ -247,136 +253,37 @@ active session 定义：
 
 ## 6. Codex 适配方案
 
-### 6.1 第一阶段：Codex hooks adapter
+### 6.1 当前实现：只读会话事件 + 可选生命周期 Hook
 
-这是推荐 MVP。原因：
+Vibe Signal 不启动、不代理、也不接管 Codex。用户继续照常从 Codex Desktop、终端或 IDE 启动任务。状态适配器由两层组成：
 
-- hooks 是 Codex 当前稳定 feature。
-- 用户继续在终端运行普通 `codex`，不需要通过菜单栏 app 启动。
-- hooks 能覆盖关键生命周期：session start、prompt submit、tool use、permission request、post tool use、stop。
-- hooks 输入包含 `session_id`、`transcript_path`、`cwd`、`hook_event_name`、`model` 等字段，足够构造状态事件。
+1. **会话事件监控器（权威层）**：只读增量扫描 `~/.codex/sessions/**/*.jsonl`，按 turn/call ID 重建状态。
+2. **生命周期 Hook（低延迟提示层）**：设置中的一个开关可写入 `~/.codex/hooks.json`，只上报 session、turn、event、cwd 等元数据。
 
-Codex hooks 到状态的映射：
+Hook 不能单独证明红灯或绿灯。官方 `PermissionRequest` 在审批路由前触发，当前 payload 不包含“最终由自动 reviewer 还是用户处理”；`Stop` 也可能被其他 Stop Hook 继续。因此 Hook 映射必须保守：
 
-| Codex hook | 状态 | reason | 说明 |
-| --- | --- | --- | --- |
-| `SessionStart` | `idle` | `session_start` | 会话已被观测到 |
-| `UserPromptSubmit` | `working` | `thinking` | 用户提交 prompt，agent 即将开始 |
-| `PreToolUse` | `working` | `tool` | 工具调用前 |
-| `PermissionRequest` | `blocked` | `approval` | 等待用户授权 |
-| `PostToolUse` | `working` | `thinking` | 工具调用结束，模型可能继续 |
-| `Stop` | `idle` | `done` | 当前 turn 停止 |
-| `SubagentStart` | `working` | `tool` | 子 agent 开始 |
-| `SubagentStop` | `working` 或 `idle` | `done` | 子 agent 停止 |
+| Codex Hook | 状态 | 说明 |
+| --- | --- | --- |
+| `SessionStart` | `unknown` | 只确认会话存在 |
+| `UserPromptSubmit` | `working` | 低延迟黄色提示 |
+| `PreToolUse` / `PostToolUse` | `working` | 工具活动提示 |
+| `PermissionRequest` | `working` | 只表示正在路由审批，不能直接亮红 |
+| `Stop` | `working`（短 TTL） | 等待落盘的 `task_complete` 确认绿色 |
+| `SessionEnd` | `unknown` | 会话结束，不等同于“所有任务空闲” |
 
-示例 hook 配置：
+当前默认安装的 Hook 只有 `SessionStart`、`SessionEnd`、`UserPromptSubmit` 和 `Stop`，避免让观察工具参与审批决策。Hook helper 无输出、短超时、Hub 离线时静默退出；它不会发布 prompt、命令、tool input/output 或 transcript 内容。
 
-```toml
-# ~/.codex/config.toml
+会话事件监控器的确认规则：
 
-[[hooks.SessionStart]]
-matcher = "startup|resume|clear|compact"
+- `task_started` / `turn_started` → 黄色。
+- `task_complete` / `turn_complete` → 绿色；携带 terminal error 时 → error。
+- `turn_aborted` → 绿色，reason 为 `interrupted`。
+- `request_user_input`、`exec_approval_request`、`apply_patch_approval_request`、`request_permissions`、`elicitation_request` → 红色。
+- 红色请求必须由相同 `call_id` / request ID 的 begin/output 事件解除；无关工具输出不能消除红灯。
+- Codex 0.147 的 rollout 实际会持久化 turn/tool 生命周期，但不总是持久化 approval request。兼容路径会结合 `turn_context.approvals_reviewer`、`approval_policy` 与 `require_escalated` 调用推断：`auto_review` 和 `never` 不亮红；user/旧版路径经防抖后标记为 `inferred` 红灯。
+- 活动超时、事件冲突、未知协议或没有 session 时一律回灰，不推断绿色。
 
-[[hooks.SessionStart.hooks]]
-type = "command"
-command = "/usr/local/bin/vibe-signal-codex-hook"
-timeout = 5
-statusMessage = "Updating Vibe Signal status"
-
-[[hooks.UserPromptSubmit]]
-
-[[hooks.UserPromptSubmit.hooks]]
-type = "command"
-command = "/usr/local/bin/vibe-signal-codex-hook"
-timeout = 5
-
-[[hooks.PreToolUse]]
-matcher = ".*"
-
-[[hooks.PreToolUse.hooks]]
-type = "command"
-command = "/usr/local/bin/vibe-signal-codex-hook"
-timeout = 5
-
-[[hooks.PermissionRequest]]
-matcher = ".*"
-
-[[hooks.PermissionRequest.hooks]]
-type = "command"
-command = "/usr/local/bin/vibe-signal-codex-hook"
-timeout = 5
-statusMessage = "Updating Codex approval status"
-
-[[hooks.PostToolUse]]
-matcher = ".*"
-
-[[hooks.PostToolUse.hooks]]
-type = "command"
-command = "/usr/local/bin/vibe-signal-codex-hook"
-timeout = 5
-
-[[hooks.Stop]]
-
-[[hooks.Stop.hooks]]
-type = "command"
-command = "/usr/local/bin/vibe-signal-codex-hook"
-timeout = 5
-```
-
-`vibe-signal-codex-hook` 的职责：
-
-1. 从 stdin 读取 Codex hook JSON。
-2. 根据 `hook_event_name`、`tool_name`、`cwd`、`session_id` 等字段映射状态。
-3. 调用 `vibe-signal emit` 或直接写 Unix socket。
-4. 不阻塞 Codex 主流程；超时要短。
-5. 如果 Hub 不存在，静默失败或写入 fallback snapshot。
-
-伪代码：
-
-```text
-input = read_json(stdin)
-eventName = input.hook_event_name
-
-switch eventName:
-  SessionStart:
-    state = idle, reason = session_start
-  UserPromptSubmit:
-    state = working, reason = thinking
-  PreToolUse:
-    state = working, reason = tool
-  PermissionRequest:
-    state = blocked, reason = approval
-  PostToolUse:
-    state = working, reason = thinking
-  Stop:
-    state = idle, reason = done
-  default:
-    state = working, reason = tool
-
-emit({
-  source: "codex",
-  adapter: "codex-hooks",
-  sessionId: input.session_id,
-  workspace: input.cwd,
-  state,
-  reason,
-  updatedAt: now(),
-  ttlMs: state == idle ? 600000 : 300000,
-  metadata: {
-    model: input.model,
-    turnId: input.turn_id,
-    toolName: input.tool_name,
-    transcriptPath: input.transcript_path
-  }
-})
-```
-
-hooks adapter 的限制：
-
-- `Stop` 表示 turn 停止，但不一定能判断最后消息是不是一个问题。
-- 如果 Codex 崩溃或用户强杀，可能没有 Stop 事件，需要 TTL 回收。
-- hooks 是 turn-scope 事件，精确度不如 app-server 的实时状态流。
-- 用户第一次启用 hook 后可能需要在 Codex 内信任 hook。
+用户首次启用 Hook 后，Codex 可能要求检查并信任该命令；安装器只添加/删除带 Vibe Signal integration ID 的 handler，并保留现有 Hook。
 
 ### 6.2 第二阶段：Codex app-server bridge
 
@@ -404,10 +311,10 @@ Codex app-server 是更高保真的状态来源。它提供 JSON-RPC 事件流�
 
 app-server bridge 的定位：
 
-- 不作为第一阶段唯一状态源。
-- 作为 Codex 精确状态增强 adapter。
-- 可以通过设置开关启用。
-- 如果 app-server 连接失败，不影响 hooks adapter 和菜单栏主功能。
+- 官方状态流本身是最高保真来源，但独立 Vibe Signal 无法订阅 Codex Desktop 已有的私有 stdio 连接。
+- 不采用“由 Vibe Signal 启动/管理共享 app-server”的方案，因为它会改变用户启动 Codex 的方式并形成单点故障。
+- 只有当 Codex 提供受支持的 attach/broadcast endpoint 时，才增加无接管的订阅 adapter。
+- 在此之前，app-server 协议用于校验状态语义和回放测试，不作为当前运行时依赖。
 
 需要注意：
 
@@ -607,11 +514,12 @@ Quit
 
 ### 8.4 通知策略
 
-可选功能：
+当前策略：
 
-- 进入 `blocked` 时发送 macOS notification。
-- 从 `blocked` 恢复到 `working` 或 `idle` 时不通知，避免噪音。
-- 同一 session 的 blocked 通知做 debounce，例如 60 秒内只发一次。
+- 仅在 session 新进入 `blocked` 或 `error` 时发送 macOS notification，重复状态更新不提醒。
+- 可选发送完成提醒；15 秒以内的短任务不提醒，避免噪音。
+- 启动时先建立状态基线，不为 snapshot 中已有的旧状态补发提醒。
+- 点击通知优先使用 `jump_url` 精确返回会话，再按应用和 workspace 回退。
 
 通知文案：
 

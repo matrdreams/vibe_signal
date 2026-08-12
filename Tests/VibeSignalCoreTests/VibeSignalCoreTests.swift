@@ -3,9 +3,31 @@ import Darwin
 @testable import VibeSignalCore
 
 final class VibeSignalCoreTests: XCTestCase {
-    func testEmptySessionsAreIdle() {
+    func testEmptySessionsAreUnknown() {
         let snapshot = SignalSnapshot.make(from: [])
-        XCTAssertEqual(snapshot.globalState, .idle)
+        XCTAssertEqual(snapshot.globalState, .unknown)
+    }
+
+    func testUnknownSessionPreventsUnverifiedGlobalWorkingOrIdle() {
+        let now = Date()
+        let unknown = SignalEvent(
+            source: "codex",
+            adapter: "test",
+            sessionId: "unknown",
+            state: .unknown,
+            reason: SignalReason.stale,
+            updatedAt: now
+        )
+        let working = SignalEvent(
+            source: "codex",
+            adapter: "test",
+            sessionId: "working",
+            state: .working,
+            reason: SignalReason.thinking,
+            updatedAt: now
+        )
+
+        XCTAssertEqual(SignalSnapshot.make(from: [working, unknown], now: now).globalState, .unknown)
     }
 
     func testGlobalStatePriority() {
@@ -100,6 +122,7 @@ final class VibeSignalCoreTests: XCTestCase {
             source: "codex",
             adapter: "codex-hooks",
             sessionId: "session-abc",
+            title: "Run the test suite",
             workspace: "/tmp/project",
             state: .working,
             reason: SignalReason.tool,
@@ -112,6 +135,53 @@ final class VibeSignalCoreTests: XCTestCase {
         let data = try SignalJSON.encode(event)
         let decoded = try SignalJSON.decode(SignalEvent.self, from: data)
         XCTAssertEqual(decoded, event)
+    }
+
+    func testCodexHookBridgeForwardsOnlyStatusMetadata() throws {
+        let input = Data(#"{"session_id":"thread-hook","turn_id":"turn-hook","cwd":"/tmp/project","hook_event_name":"UserPromptSubmit","prompt":"private prompt"}"#.utf8)
+        let event = try XCTUnwrap(CodexHookBridge.makeEvent(
+            from: input,
+            now: Date(timeIntervalSince1970: 100)
+        ))
+
+        XCTAssertEqual(event.state, .working)
+        XCTAssertEqual(event.sessionId, "thread-hook")
+        XCTAssertEqual(event.workspace, "/tmp/project")
+        XCTAssertEqual(event.metadata?["turn_id"], .string("turn-hook"))
+        XCTAssertNil(event.metadata?["prompt"])
+    }
+
+    func testPermissionHookIsActivityHintRatherThanBlockedClaim() throws {
+        let input = Data(#"{"session_id":"thread-hook","turn_id":"turn-hook","cwd":"/tmp/project","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"private"}}"#.utf8)
+        let event = try XCTUnwrap(CodexHookBridge.makeEvent(from: input))
+
+        XCTAssertEqual(event.state, .working)
+        XCTAssertEqual(event.reason, SignalReason.approval)
+        XCTAssertNil(event.metadata?["tool_input"])
+    }
+
+    func testCodexHookConfigurationPreservesExistingHooks() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VibeSignalHookTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let configurationURL = directory.appendingPathComponent("hooks.json")
+        let existing = #"{"hooks":{"SessionStart":[{"matcher":"resume","hooks":[{"type":"command","command":"/usr/bin/true"}]}]}}"#
+        try Data(existing.utf8).write(to: configurationURL)
+
+        let manager = CodexHookConfigurationManager(
+            configurationURL: configurationURL,
+            executableURL: URL(fileURLWithPath: "/usr/bin/true")
+        )
+        try manager.install()
+        XCTAssertTrue(manager.isInstalled())
+
+        try manager.uninstall()
+        XCTAssertFalse(manager.isInstalled())
+        let saved = try String(contentsOf: configurationURL)
+        XCTAssertTrue(saved.contains(#""matcher" : "resume""#))
     }
 
     func testSocketOwnershipConflictsIncludeBindAddressInUse() {
@@ -156,14 +226,47 @@ final class VibeSignalCoreTests: XCTestCase {
         XCTAssertEqual(store.snapshot(now: now).sessions.count, 2)
     }
 
+    func testStatusStoreKeepsTitleAndNavigationMetadataAcrossAdapterUpdates() {
+        let store = StatusStore()
+        let now = Date()
+        store.apply(SignalEvent(
+            source: "codex",
+            adapter: "codex-notify",
+            sessionId: "thread-1",
+            title: "Fix login",
+            workspace: "/tmp/project",
+            state: .working,
+            reason: SignalReason.thinking,
+            updatedAt: now,
+            metadata: ["jump_url": .string("codex://threads/thread-1")]
+        ), now: now)
+
+        store.apply(SignalEvent(
+            source: "codex",
+            adapter: "codex-session-monitor",
+            sessionId: "thread-1",
+            state: .blocked,
+            reason: SignalReason.approval,
+            updatedAt: now.addingTimeInterval(1)
+        ), now: now.addingTimeInterval(1))
+
+        let event = store.snapshot(now: now.addingTimeInterval(1)).sessions.first
+        XCTAssertEqual(event?.title, "Fix login")
+        XCTAssertEqual(event?.workspace, "/tmp/project")
+        XCTAssertEqual(event?.metadata?["jump_url"], .string("codex://threads/thread-1"))
+    }
+
     func testCodexSessionMonitorEmitsActiveSeedAndIdleCompletion() throws {
         let codexHome = try makeTemporaryCodexHome()
         let sessionID = "019e5982-0b7c-78e2-a08b-771afa1bc9e4"
+        let headPadding = String(repeating: "x", count: 70_000)
         let sessionFile = try writeSessionFile(
             codexHome: codexHome,
             sessionID: sessionID,
             lines: [
                 #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5982-0b7c-78e2-a08b-771afa1bc9e4","cwd":"/tmp/project","originator":"codex-tui"}}"#,
+                headPadding,
+                #"{"timestamp":"2026-05-24T10:22:51.645Z","type":"event_msg","payload":{"type":"user_message","message":"Context notes\n## My request:\nFix login on macOS"}}"#,
                 #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 #"{"timestamp":"2026-05-24T10:23:01.894Z","type":"response_item","payload":{"type":"web_search_call","status":"completed"}}"#
             ]
@@ -184,8 +287,13 @@ final class VibeSignalCoreTests: XCTestCase {
         monitor.scanOnceForTesting()
         XCTAssertEqual(events.last?.sessionId, sessionID)
         XCTAssertEqual(events.last?.workspace, "/tmp/project")
+        XCTAssertEqual(events.last?.title, "Fix login on macOS")
         XCTAssertEqual(events.last?.state, .working)
         XCTAssertEqual(events.last?.message, "Searching the web")
+        XCTAssertEqual(
+            events.last?.metadata?["jump_url"],
+            .string("codex://threads/\(sessionID)")
+        )
 
         try appendLine(
             #"{"timestamp":"2026-05-24T10:23:25.259Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
@@ -280,7 +388,8 @@ final class VibeSignalCoreTests: XCTestCase {
             configuration: CodexSessionMonitor.Configuration(
                 codexHomeURL: codexHome,
                 pollInterval: 60,
-                refreshInterval: 600
+                refreshInterval: 600,
+                blockedEmitDelay: 0
             )
         ) { event in
             events.append(event)
@@ -290,12 +399,19 @@ final class VibeSignalCoreTests: XCTestCase {
         XCTAssertEqual(events.last?.state, .working)
 
         try appendLine(
-            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sleep 5\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"test\"}","call_id":"call-approval"}}"#,
+            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"exec_approval_request","call_id":"call-approval","turn_id":"turn-approval"}}"#,
             to: sessionFile
         )
         monitor.scanOnceForTesting()
         XCTAssertEqual(events.last?.state, .blocked)
         XCTAssertEqual(events.last?.reason, SignalReason.approval)
+
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-unrelated","output":"done"}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .blocked)
 
         try appendLine(
             #"{"timestamp":"2026-05-24T10:23:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-approval","output":"done"}}"#,
@@ -314,13 +430,16 @@ final class VibeSignalCoreTests: XCTestCase {
             lines: [
                 #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5994-3333-7444-8555-666677778888","cwd":"/tmp/seeded-approval","originator":"codex-tui"}}"#,
                 #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-seeded-approval"}}"#,
-                #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sleep 5\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"test\"}","call_id":"call-seeded-approval"}}"#
+                #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"exec_approval_request","call_id":"call-seeded-approval","turn_id":"turn-seeded-approval"}}"#
             ]
         )
 
         var events: [SignalEvent] = []
         let monitor = CodexSessionMonitor(
-            configuration: CodexSessionMonitor.Configuration(codexHomeURL: codexHome)
+            configuration: CodexSessionMonitor.Configuration(
+                codexHomeURL: codexHome,
+                blockedEmitDelay: 0
+            )
         ) { event in
             events.append(event)
         }
@@ -328,6 +447,57 @@ final class VibeSignalCoreTests: XCTestCase {
         monitor.scanOnceForTesting()
         XCTAssertEqual(events.last?.state, .blocked)
         XCTAssertEqual(events.last?.reason, SignalReason.approval)
+    }
+
+    func testCodexSessionMonitorRestoresLegacyUserReviewedApprovalAsBlocked() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e5994-aaaa-7444-8555-666677778888"
+        _ = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5994-aaaa-7444-8555-666677778888","cwd":"/tmp/seeded-user-review","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.645Z","type":"turn_context","payload":{"turn_id":"turn-seeded-user","cwd":"/tmp/seeded-user-review","approval_policy":"on-request","approvals_reviewer":"user"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-seeded-user"}}"#,
+                #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sleep 5\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"test\"}","call_id":"call-seeded-user"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(
+                codexHomeURL: codexHome,
+                blockedEmitDelay: 0
+            )
+        ) { events.append($0) }
+
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .blocked)
+        XCTAssertEqual(events.last?.metadata?["state_certainty"], .string("inferred"))
+    }
+
+    func testCodexSessionMonitorDoesNotRestoreAutoReviewedApprovalAsBlocked() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e5994-bbbb-7444-8555-666677778888"
+        _ = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5994-bbbb-7444-8555-666677778888","cwd":"/tmp/seeded-auto-review","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.645Z","type":"turn_context","payload":{"turn_id":"turn-seeded-auto","cwd":"/tmp/seeded-auto-review","approval_policy":"on-request","approvals_reviewer":"auto_review"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-seeded-auto"}}"#,
+                #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"true\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"test\"}","call_id":"call-seeded-auto"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(codexHomeURL: codexHome)
+        ) { events.append($0) }
+
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .working)
+        XCTAssertFalse(events.contains(where: { $0.state == .blocked }))
     }
 
     func testCodexSessionMonitorDoesNotRestoreCompletedEscalatedCommandAsBlocked() throws {
@@ -364,6 +534,7 @@ final class VibeSignalCoreTests: XCTestCase {
             sessionID: sessionID,
             lines: [
                 #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5995-3333-7444-8555-666677778888","cwd":"/tmp/auto-review","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.645Z","type":"turn_context","payload":{"turn_id":"turn-auto-review","cwd":"/tmp/auto-review","approval_policy":"on-request","approvals_reviewer":"auto_review"}}"#,
                 #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-auto-review"}}"#
             ]
         )
@@ -384,15 +555,19 @@ final class VibeSignalCoreTests: XCTestCase {
         XCTAssertEqual(events.last?.state, .working)
 
         try appendLine(
-            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"true\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"test\"}","call_id":"call-auto-review"}}"#,
+            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.exec_command({cmd: \"true\", sandbox_permissions: \"require_escalated\"});","call_id":"call-auto-review"}}"#,
             to: sessionFile
         )
         monitor.scanOnceForTesting(now: Date(timeIntervalSince1970: 101))
         XCTAssertEqual(events.last?.state, .working)
         XCTAssertFalse(events.contains(where: { $0.state == .blocked }))
 
+        monitor.scanOnceForTesting(now: Date(timeIntervalSince1970: 115))
+        XCTAssertEqual(events.last?.state, .working)
+        XCTAssertFalse(events.contains(where: { $0.state == .blocked }))
+
         try appendLine(
-            #"{"timestamp":"2026-05-24T10:23:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-auto-review","output":"done"}}"#,
+            #"{"timestamp":"2026-05-24T10:23:01.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-auto-review","output":"done"}}"#,
             to: sessionFile
         )
         monitor.scanOnceForTesting(now: Date(timeIntervalSince1970: 102))
@@ -408,6 +583,7 @@ final class VibeSignalCoreTests: XCTestCase {
             sessionID: sessionID,
             lines: [
                 #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5996-3333-7444-8555-666677778888","cwd":"/tmp/manual-approval","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.645Z","type":"turn_context","payload":{"turn_id":"turn-manual-approval","cwd":"/tmp/manual-approval","approval_policy":"on-request","approvals_reviewer":"user"}}"#,
                 #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-manual-approval"}}"#
             ]
         )
@@ -437,6 +613,201 @@ final class VibeSignalCoreTests: XCTestCase {
         monitor.scanOnceForTesting(now: Date(timeIntervalSince1970: 204))
         XCTAssertEqual(events.last?.state, .blocked)
         XCTAssertEqual(events.last?.reason, SignalReason.approval)
+    }
+
+    func testCodexSessionMonitorTracksBlockingQuestionByCallID() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e5998-3333-7444-8555-666677778888"
+        let sessionFile = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5998-3333-7444-8555-666677778888","cwd":"/tmp/question","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-question"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(
+                codexHomeURL: codexHome,
+                refreshInterval: 600,
+                blockedEmitDelay: 0
+            )
+        ) { events.append($0) }
+
+        monitor.scanOnceForTesting()
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"request_user_input","call_id":"call-question","turn_id":"turn-question","isBlocking":true,"questions":[]}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .blocked)
+        XCTAssertEqual(events.last?.reason, SignalReason.question)
+
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-question","output":"answered"}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .working)
+    }
+
+    func testCodexSessionMonitorCoversPatchPermissionAndElicitationRequests() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e5998-cccc-7444-8555-666677778888"
+        let sessionFile = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5998-cccc-7444-8555-666677778888","cwd":"/tmp/interactions","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-interactions"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(
+                codexHomeURL: codexHome,
+                refreshInterval: 600,
+                blockedEmitDelay: 0
+            )
+        ) { events.append($0) }
+        monitor.scanOnceForTesting()
+
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"apply_patch_approval_request","call_id":"call-patch","turn_id":"turn-interactions"}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .blocked)
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:01.000Z","type":"event_msg","payload":{"type":"patch_apply_begin","call_id":"call-patch","turn_id":"turn-interactions"}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .working)
+
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:02.000Z","type":"event_msg","payload":{"type":"request_permissions","call_id":"call-permission","turn_id":"turn-interactions"}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .blocked)
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-permission","output":"done"}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .working)
+
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:04.000Z","type":"event_msg","payload":{"type":"elicitation_request","id":"request-1","turn_id":"turn-interactions","server_name":"example"}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .blocked)
+        XCTAssertEqual(events.last?.reason, SignalReason.question)
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"request-1","output":"done"}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .working)
+    }
+
+    func testCodexSessionMonitorDoesNotBlockForNonBlockingQuestion() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e5999-3333-7444-8555-666677778888"
+        let sessionFile = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5999-3333-7444-8555-666677778888","cwd":"/tmp/nonblocking","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-nonblocking"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(
+                codexHomeURL: codexHome,
+                refreshInterval: 600,
+                blockedEmitDelay: 0
+            )
+        ) { events.append($0) }
+
+        monitor.scanOnceForTesting()
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"request_user_input","call_id":"call-nonblocking","turn_id":"turn-nonblocking","isBlocking":false,"questions":[]}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .working)
+        XCTAssertFalse(events.contains(where: { $0.state == .blocked }))
+    }
+
+    func testCodexSessionMonitorEmitsTerminalError() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e6000-3333-7444-8555-666677778888"
+        let sessionFile = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e6000-3333-7444-8555-666677778888","cwd":"/tmp/error","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-error"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(codexHomeURL: codexHome)
+        ) { events.append($0) }
+
+        monitor.scanOnceForTesting()
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:22:59.000Z","type":"event_msg","payload":{"type":"error","message":"Cannot steer this turn","codex_error_info":{"active_turn_not_steerable":{"turn_kind":"review"}}}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .working)
+
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"error","message":"Connection failed"}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .error)
+        XCTAssertEqual(events.last?.message, "Connection failed")
+    }
+
+    func testCodexSessionMonitorFailsClosedWhenActivityGoesStale() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e6001-3333-7444-8555-666677778888"
+        _ = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e6001-3333-7444-8555-666677778888","cwd":"/tmp/stale","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-stale"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(
+                codexHomeURL: codexHome,
+                refreshInterval: 600,
+                staleAfter: 1
+            )
+        ) { events.append($0) }
+        let initial = Date()
+
+        monitor.scanOnceForTesting(now: initial)
+        XCTAssertEqual(events.last?.state, .working)
+        monitor.scanOnceForTesting(now: initial.addingTimeInterval(2))
+        XCTAssertEqual(events.last?.state, .unknown)
+        XCTAssertEqual(events.last?.reason, SignalReason.stale)
     }
 
     func testCodexSessionMonitorSeedFindsCompletionBeforeLargeNoisyTail() throws {

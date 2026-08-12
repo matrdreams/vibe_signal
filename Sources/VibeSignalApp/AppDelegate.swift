@@ -1,7 +1,8 @@
 import AppKit
+import UserNotifications
 import VibeSignalCore
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     private let paths = VibeSignalPaths()
     private lazy var store = StatusStore(persistence: SnapshotPersistence(url: paths.snapshotURL))
     private var server: SignalHubServer?
@@ -10,9 +11,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var currentSnapshot = SignalSnapshot(globalState: .unknown, sessions: [])
     private var settingsWindowController: SettingsWindowController?
     private var refreshTimer: Timer?
+    private let notificationCoordinator = NotificationCoordinator()
+    private let sessionNavigator = SessionNavigator()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        UNUserNotificationCenter.current().delegate = self
+        notificationCoordinator.configure()
 
         var initialSnapshot: SignalSnapshot?
         do {
@@ -50,6 +55,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshTimer?.invalidate()
         codexMonitor?.stop()
         server?.stop()
+    }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        openSettings()
+        return true
     }
 
     private func startHub() throws {
@@ -102,6 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         currentSnapshot = snapshot
         statusItem?.button?.image = TrafficLightIcon.image(for: snapshot.globalState)
         statusItem?.button?.toolTip = "Vibe Signal: \(displayName(for: snapshot.globalState))"
+        notificationCoordinator.process(snapshot)
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -177,12 +191,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func sessionItem(for event: SignalEvent) -> NSMenuItem {
-        let workspace = event.workspace.map(workspaceName) ?? event.sessionId
-        let detail = event.message ?? event.reason
-        let item = NSMenuItem(title: "\(workspace) - \(detail)", action: nil, keyEquivalent: "")
+        let title = event.title.flatMap(nonEmpty) ?? event.workspace.map(workspaceName) ?? event.sessionId
+        let status = displayName(for: event.state)
+        let elapsed = elapsedDescription(for: event)
+        let item = NSMenuItem(
+            title: "\(title) — \(status) · \(elapsed)",
+            action: #selector(openSession(_:)),
+            keyEquivalent: ""
+        )
+        item.target = self
+        item.representedObject = event.sessionKey
         item.image = TrafficLightIcon.dot(for: event.state)
-        item.toolTip = "\(event.source) / \(event.adapter) / \(event.sessionId)"
+        item.toolTip = [event.message, event.workspace]
+            .compactMap { $0.flatMap(nonEmpty) }
+            .joined(separator: "\n")
         return item
+    }
+
+    @objc private func openSession(_ sender: NSMenuItem) {
+        guard let sessionKey = sender.representedObject as? String else {
+            return
+        }
+        _ = openSession(sessionKey: sessionKey)
     }
 
     @objc private func openWorkspace(_ sender: NSMenuItem) {
@@ -205,6 +235,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.terminate(nil)
     }
 
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let userInfo = response.notification.request.content.userInfo
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            let sessionKey = userInfo[NotificationCoordinator.sessionKeyUserInfoKey] as? String
+            if let sessionKey, self.openSession(sessionKey: sessionKey) {
+                return
+            }
+
+            _ = self.sessionNavigator.open(
+                jumpURL: userInfo[NotificationCoordinator.jumpURLUserInfoKey] as? String,
+                hostBundleIdentifier: userInfo[NotificationCoordinator.hostBundleUserInfoKey] as? String,
+                workspace: userInfo[NotificationCoordinator.workspaceUserInfoKey] as? String
+            )
+        }
+        completionHandler()
+    }
+
+    private func openSession(sessionKey: String) -> Bool {
+        guard let event = currentSnapshot.sessions.first(where: { $0.sessionKey == sessionKey }) else {
+            return false
+        }
+        return sessionNavigator.open(event)
+    }
+
     private func displayName(for state: SignalState) -> String {
         switch state {
         case .blocked:
@@ -223,6 +293,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func workspaceName(_ path: String) -> String {
         let name = URL(fileURLWithPath: path).lastPathComponent
         return name.isEmpty ? path : name
+    }
+
+    private func elapsedDescription(for event: SignalEvent, now: Date = Date()) -> String {
+        let start = event.state.isActive ? (event.startedAt ?? event.updatedAt) : event.updatedAt
+        let seconds = max(0, Int(now.timeIntervalSince(start)))
+        if seconds < 60 {
+            return "\(seconds)s"
+        }
+        if seconds < 3_600 {
+            return "\(seconds / 60)m"
+        }
+        if seconds < 86_400 {
+            let hours = seconds / 3_600
+            let minutes = (seconds % 3_600) / 60
+            return minutes == 0 ? "\(hours)h" : "\(hours)h \(minutes)m"
+        }
+        return "\(seconds / 86_400)d"
+    }
+
+    private func nonEmpty(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func unique(_ values: [String]) -> [String] {

@@ -13,12 +13,12 @@ public enum SignalState: String, Codable, CaseIterable, Equatable, Sendable {
             return 50
         case .error:
             return 40
+        case .unknown:
+            return 35
         case .working:
             return 30
         case .idle:
             return 20
-        case .unknown:
-            return 10
         }
     }
 
@@ -36,7 +36,9 @@ public enum SignalReason {
     public static let fileChange = "file_change"
     public static let review = "review"
     public static let done = "done"
+    public static let interrupted = "interrupted"
     public static let sessionStart = "session_start"
+    public static let sessionEnd = "session_end"
     public static let error = "error"
     public static let stale = "stale"
 }
@@ -117,6 +119,7 @@ public struct SignalEvent: Codable, Equatable, Sendable, Identifiable {
     public var source: String
     public var adapter: String
     public var sessionId: String
+    public var title: String?
     public var workspace: String?
     public var state: SignalState
     public var reason: String
@@ -139,6 +142,7 @@ public struct SignalEvent: Codable, Equatable, Sendable, Identifiable {
         source: String,
         adapter: String,
         sessionId: String,
+        title: String? = nil,
         workspace: String? = nil,
         state: SignalState,
         reason: String,
@@ -152,6 +156,7 @@ public struct SignalEvent: Codable, Equatable, Sendable, Identifiable {
         self.source = source
         self.adapter = adapter
         self.sessionId = sessionId
+        self.title = title
         self.workspace = workspace
         self.state = state
         self.reason = reason
@@ -221,10 +226,13 @@ public struct SignalSnapshot: Codable, Equatable, Sendable {
 
     public static func aggregate(events: [SignalEvent]) -> SignalState {
         guard !events.isEmpty else {
-            return .idle
+            return .unknown
         }
 
-        for state in [SignalState.blocked, .error, .working, .idle] {
+        // Unknown outranks working and idle because a definitive global colour
+        // must account for every observed session. A verified blocked/error
+        // remains actionable even if another source has gone stale.
+        for state in [SignalState.blocked, .error, .unknown, .working, .idle] {
             if events.contains(where: { $0.state == state }) {
                 return state
             }
