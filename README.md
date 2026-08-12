@@ -38,7 +38,24 @@ triple is required.
 
 Development builds are unsigned by default. If an ad-hoc signature is useful
 for local testing, build with `VIBE_SIGNAL_ADHOC_SIGN=1`. Developer ID signing
-and notarization are intentionally left for the release process.
+and notarization are handled by the release process.
+
+Public releases require an Apple notary profile stored securely in the macOS
+Keychain. `notarytool` prompts for the app-specific password without placing it
+in shell history:
+
+```sh
+xcrun notarytool store-credentials VibeSignalNotary \
+  --apple-id "YOUR_APPLE_ID" \
+  --team-id "3TBP5MLMTQ"
+
+VIBE_SIGNAL_NOTARY_PROFILE=VibeSignalNotary ./scripts/release-macos.sh
+```
+
+The release script signs and notarizes both the app and its Universal DMG,
+staples their tickets, and runs Gatekeeper assessments. It exits before
+building when no notary profile is configured, so an unnotarized public build
+cannot be produced accidentally.
 
 Launch the app from Finder or with:
 
