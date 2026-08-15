@@ -144,7 +144,9 @@ cp "$BUILD/vibe-signal" "$MACOS/vibe-signal"
 cp "$BUILD/vibe-signal" "$DIST/vibe-signal"
 cp "$BUILD/libVibeSignalCore.dylib" "$DIST/libVibeSignalCore.dylib"
 cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
-cp "$ROOT/Resources/AppIcon.icns" "$RESOURCES/AppIcon.icns"
+"$ROOT/scripts/generate-app-icon.sh" \
+    "$ROOT/Resources/AppIcon.png" \
+    "$RESOURCES" >/dev/null
 chmod +x "$MACOS/VibeSignalApp" "$MACOS/vibe-signal" "$DIST/vibe-signal"
 
 if [[ -d "$CONTENTS/_CodeSignature" ]]; then
