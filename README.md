@@ -27,6 +27,15 @@ By default the script builds Universal Binaries containing both Apple Silicon
 - `dist/vibe-signal`
 - `dist/libVibeSignalCore.dylib`
 
+The build compiles `Resources/AppIcon.png` through a macOS asset catalog. The
+application bundle contains both the legacy `AppIcon.icns` fallback and an
+`Assets.car` with all 16–1024 px representations required by Finder and
+Launchpad. Regenerate the compiled icon assets independently with:
+
+```sh
+./scripts/generate-app-icon.sh
+```
+
 For a faster single-architecture development build, override the architecture:
 
 ```sh
