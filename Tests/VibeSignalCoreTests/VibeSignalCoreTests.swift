@@ -1120,6 +1120,54 @@ final class VibeSignalCoreTests: XCTestCase {
         )
     }
 
+    func testCodexSessionMonitorAcceptsJSONWhitespaceWithoutMatchingTypePrefixes() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e6010-3333-7444-8555-666677778888"
+        let sessionFile = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type" : "session_meta","payload":{"id":"019e6010-3333-7444-8555-666677778888","cwd":"/tmp/兼容性","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:52.000Z","type":"event_msg","payload":{"type" : "task_started_extra","turn_id":"not-a-turn"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(codexHomeURL: codexHome)
+        ) { events.append($0) }
+
+        monitor.scanOnceForTesting()
+        XCTAssertTrue(events.isEmpty)
+
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"message","role" : "user","content":[{"type":"input_text","text":"优化中文日志兼容性"}]}}"#,
+            to: sessionFile
+        )
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:01.000Z","type":"event_msg","payload":{"type" : "task_started","turn_id":"turn-whitespace"}}"#,
+            to: sessionFile
+        )
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:02.000Z","type":"response_item","payload":{"type" : "web_search_call","status":"completed"}}"#,
+            to: sessionFile
+        )
+
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .working)
+        XCTAssertEqual(events.last?.workspace, "/tmp/兼容性")
+        XCTAssertEqual(events.last?.title, "优化中文日志兼容性")
+        XCTAssertEqual(events.last?.message, "Searching the web")
+
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:03.000Z","type" : "event_msg","payload":{"type" : "task_complete","turn_id":"turn-whitespace"}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .idle)
+        XCTAssertEqual(events.last?.reason, SignalReason.done)
+    }
+
     func testCodexSessionMonitorCompletesRecordSplitAcrossStartup() throws {
         let codexHome = try makeTemporaryCodexHome()
         let sessionID = "019e6009-3333-7444-8555-666677778888"

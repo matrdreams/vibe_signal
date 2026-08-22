@@ -1626,6 +1626,23 @@ private struct CodexSessionRecord {
 }
 
 private final class CodexSessionLineParser {
+    private static let typeKey = Array("\"type\"".utf8)
+    private static let roleKey = Array("\"role\"".utf8)
+    private static let userValue = Array("user".utf8)
+    private static let relevantTypeValues = [
+        "session_meta", "turn_context", "user_message",
+        "task_started", "turn_started", "task_complete", "turn_complete", "turn_aborted",
+        "exec_approval_request", "apply_patch_approval_request", "request_permissions",
+        "request_user_input", "elicitation_request", "mcp_elicitation_request",
+        "error", "warning", "stream_error",
+        "exec_command_begin", "exec_command_end", "patch_apply_begin", "patch_apply_end",
+        "mcp_tool_call_begin", "mcp_tool_call_end", "web_search_begin", "web_search_end",
+        "image_generation_begin", "image_generation_end",
+        "dynamic_tool_call_request", "dynamic_tool_call_response",
+        "web_search_call", "function_call", "function_call_output",
+        "custom_tool_call", "custom_tool_call_output", "local_shell_call"
+    ].map { Array($0.utf8) }
+
     private let dateFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -1693,23 +1710,117 @@ private final class CodexSessionLineParser {
     }
 
     private func mightContainRelevantRecord(_ line: String) -> Bool {
-        let relevantTypes = [
-            "session_meta", "turn_context", "user_message",
-            "task_started", "turn_started", "task_complete", "turn_complete", "turn_aborted",
-            "exec_approval_request", "apply_patch_approval_request", "request_permissions",
-            "request_user_input", "elicitation_request", "mcp_elicitation_request",
-            "error", "warning", "stream_error",
-            "exec_command_begin", "exec_command_end", "patch_apply_begin", "patch_apply_end",
-            "mcp_tool_call_begin", "mcp_tool_call_end", "web_search_begin", "web_search_end",
-            "image_generation_begin", "image_generation_end",
-            "dynamic_tool_call_request", "dynamic_tool_call_response",
-            "web_search_call", "function_call", "function_call_output",
-            "custom_tool_call", "custom_tool_call_output", "local_shell_call"
-        ]
+        // Tool output records can be several megabytes. Scan their UTF-8 bytes
+        // once instead of running a locale-aware String search for every type.
+        if let result = line.utf8.withContiguousStorageIfAvailable({ bytes in
+            Self.mightContainRelevantRecord(in: bytes)
+        }) {
+            return result
+        }
 
-        return relevantTypes.contains(where: { serializedType($0, appearsIn: line) })
-            || line.contains(#""role":"user""#)
-            || line.contains(#""role": "user""#)
+        let bytes = Array(line.utf8)
+        return bytes.withUnsafeBufferPointer { buffer in
+            Self.mightContainRelevantRecord(in: buffer)
+        }
+    }
+
+    private static func mightContainRelevantRecord(in bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        var index = 0
+        while index < bytes.count {
+            guard bytes[index] == 0x22, index + 1 < bytes.count else {
+                index += 1
+                continue
+            }
+
+            switch bytes[index + 1] {
+            case 0x74: // t
+                if let valueStart = serializedStringValueStart(
+                    forKey: typeKey,
+                    at: index,
+                    in: bytes
+                ), relevantTypeValues.contains(where: {
+                    serializedStringValue($0, matchesAt: valueStart, in: bytes)
+                }) {
+                    return true
+                }
+
+            case 0x72: // r
+                if let valueStart = serializedStringValueStart(
+                    forKey: roleKey,
+                    at: index,
+                    in: bytes
+                ), serializedStringValue(userValue, matchesAt: valueStart, in: bytes) {
+                    return true
+                }
+
+            default:
+                break
+            }
+
+            index += 1
+        }
+        return false
+    }
+
+    private static func serializedStringValueStart(
+        forKey key: [UInt8],
+        at index: Int,
+        in bytes: UnsafeBufferPointer<UInt8>
+    ) -> Int? {
+        guard matchesBytes(key, at: index, in: bytes) else {
+            return nil
+        }
+
+        var quoteIndex = index + key.count
+        skipJSONWhitespace(in: bytes, from: &quoteIndex)
+        guard quoteIndex < bytes.count, bytes[quoteIndex] == 0x3A else {
+            return nil
+        }
+        quoteIndex += 1
+        skipJSONWhitespace(in: bytes, from: &quoteIndex)
+        guard quoteIndex < bytes.count, bytes[quoteIndex] == 0x22 else {
+            return nil
+        }
+        return quoteIndex + 1
+    }
+
+    private static func skipJSONWhitespace(
+        in bytes: UnsafeBufferPointer<UInt8>,
+        from index: inout Int
+    ) {
+        while index < bytes.count {
+            switch bytes[index] {
+            case 0x09, 0x0A, 0x0D, 0x20:
+                index += 1
+            default:
+                return
+            }
+        }
+    }
+
+    private static func serializedStringValue(
+        _ value: [UInt8],
+        matchesAt index: Int,
+        in bytes: UnsafeBufferPointer<UInt8>
+    ) -> Bool {
+        let closingQuoteIndex = index + value.count
+        return closingQuoteIndex < bytes.count
+            && bytes[closingQuoteIndex] == 0x22
+            && matchesBytes(value, at: index, in: bytes)
+    }
+
+    private static func matchesBytes(
+        _ expected: [UInt8],
+        at index: Int,
+        in bytes: UnsafeBufferPointer<UInt8>
+    ) -> Bool {
+        guard index >= 0, expected.count <= bytes.count - index else {
+            return false
+        }
+        for offset in expected.indices where bytes[index + offset] != expected[offset] {
+            return false
+        }
+        return true
     }
 
     private func isSubagentSource(_ source: Any?) -> Bool {
@@ -1720,10 +1831,6 @@ private final class CodexSessionLineParser {
             return false
         }
         return source["subagent"] != nil
-    }
-
-    private func serializedType(_ type: String, appearsIn line: String) -> Bool {
-        line.contains(#""type":"\#(type)""#) || line.contains(#""type": "\#(type)""#)
     }
 
     private func parseEventMessage(payload: [String: Any]?, timestamp: Date?) -> CodexSessionRecord {
