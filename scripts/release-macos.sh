@@ -11,6 +11,7 @@ VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO
 BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO_PLIST")"
 DMG="$DIST/Vibe-Signal-$VERSION-universal.dmg"
 NOTARY_ARCHIVE="$DIST/Vibe-Signal-$VERSION-notarization.zip"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 if [[ -z "$NOTARY_PROFILE" ]]; then
     cat >&2 <<'EOF'
@@ -67,6 +68,10 @@ spctl --assess --type execute --verbose=4 "$APP"
 
 STAGING="$(mktemp -d "$DIST/dmg-staging.XXXXXX")"
 cleanup() {
+    if [[ -x "$LSREGISTER" ]]; then
+        "$LSREGISTER" -u "$STAGING/Vibe Signal.app" >/dev/null 2>&1 || true
+        "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true
+    fi
     if [[ -d "$STAGING" ]]; then
         rm -r "$STAGING"
     fi

@@ -2,10 +2,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP_BIN="$ROOT/dist/Vibe Signal.app/Contents/MacOS/VibeSignalApp"
+APP="$ROOT/dist/Vibe Signal.app"
+APP_BIN="$APP/Contents/MacOS/VibeSignalApp"
 CLI="$ROOT/dist/vibe-signal"
 LOG="$ROOT/.build/manual/smoke-app.log"
 SMOKE_RUNTIME="$ROOT/.build/manual/smoke-runtime"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 export VIBE_SIGNAL_APP_SUPPORT="$SMOKE_RUNTIME/app-support"
 export VIBE_SIGNAL_SOCKET="$SMOKE_RUNTIME/vibe-signal.sock"
 SOCKET="$("$CLI" paths | awk -F': ' '/^socket:/ { print $2 }')"
@@ -24,6 +26,9 @@ APP_PID="$!"
 cleanup() {
     kill "$APP_PID" >/dev/null 2>&1 || true
     wait "$APP_PID" >/dev/null 2>&1 || true
+    if [[ -x "$LSREGISTER" ]]; then
+        "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 
