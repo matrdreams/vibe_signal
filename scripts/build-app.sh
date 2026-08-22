@@ -10,29 +10,7 @@ CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-
-if [[ -n "${TARGET:-}" ]]; then
-    TARGETS=("$TARGET")
-else
-    read -r -a ARCHITECTURES <<< "${VIBE_SIGNAL_ARCHS:-arm64 x86_64}"
-    if [[ "${#ARCHITECTURES[@]}" -eq 0 ]]; then
-        echo "VIBE_SIGNAL_ARCHS must contain at least one architecture." >&2
-        exit 1
-    fi
-
-    TARGETS=()
-    for ARCHITECTURE in "${ARCHITECTURES[@]}"; do
-        case "$ARCHITECTURE" in
-            arm64|x86_64)
-                TARGETS+=("$ARCHITECTURE-apple-macosx13.0")
-                ;;
-            *)
-                echo "Unsupported architecture: $ARCHITECTURE (expected arm64 or x86_64)" >&2
-                exit 1
-                ;;
-        esac
-    done
-fi
+TARGET="arm64-apple-macosx13.0"
 
 # The generated app uses the same bundle identifier as the installed app.
 # Keep the staging directory out of Spotlight so Apps/Launchpad does not show
@@ -49,10 +27,6 @@ if [[ "$CONFIGURATION" == "release" ]]; then
 else
     OPTIMIZATION_FLAGS=(-Onone -g)
 fi
-
-APP_BINARIES=()
-CLI_BINARIES=()
-CORE_LIBRARIES=()
 
 build_target() {
     local target="$1"
@@ -97,52 +71,27 @@ build_target() {
         "${APP_SOURCES[@]}" \
         -o "$architecture_build/VibeSignalApp"
 
-    APP_BINARIES+=("$architecture_build/VibeSignalApp")
-    CLI_BINARIES+=("$architecture_build/vibe-signal")
-    CORE_LIBRARIES+=("$architecture_build/libVibeSignalCore.dylib")
 }
 
-merge_or_copy() {
-    local output="$1"
-    shift
-
-    if [[ "$#" -eq 1 ]]; then
-        cp "$1" "$output"
-        return
-    fi
-
-    local temporary_directory
-    temporary_directory="$(mktemp -d "$BUILD/lipo.XXXXXX")"
-    lipo -create "$@" -output "$temporary_directory/merged"
-    mv "$temporary_directory/merged" "$output"
-    rmdir "$temporary_directory"
-}
-
-verify_architectures() {
+verify_arm64_only() {
     local binary="$1"
-    local target
-    local architecture
+    local architectures
 
-    for target in "${TARGETS[@]}"; do
-        architecture="${target%%-*}"
-        if ! lipo "$binary" -verify_arch "$architecture"; then
-            echo "Missing $architecture slice in $binary" >&2
-            exit 1
-        fi
-    done
+    architectures="$(lipo -archs "$binary")"
+    if [[ "$architectures" != "arm64" ]]; then
+        echo "Expected an arm64-only binary, found '$architectures': $binary" >&2
+        exit 1
+    fi
 }
 
-for TARGET_TRIPLE in "${TARGETS[@]}"; do
-    build_target "$TARGET_TRIPLE"
-done
+build_target "$TARGET"
+cp "$BUILD/arm64/VibeSignalApp" "$BUILD/VibeSignalApp"
+cp "$BUILD/arm64/vibe-signal" "$BUILD/vibe-signal"
+cp "$BUILD/arm64/libVibeSignalCore.dylib" "$BUILD/libVibeSignalCore.dylib"
 
-merge_or_copy "$BUILD/VibeSignalApp" "${APP_BINARIES[@]}"
-merge_or_copy "$BUILD/vibe-signal" "${CLI_BINARIES[@]}"
-merge_or_copy "$BUILD/libVibeSignalCore.dylib" "${CORE_LIBRARIES[@]}"
-
-verify_architectures "$BUILD/VibeSignalApp"
-verify_architectures "$BUILD/vibe-signal"
-verify_architectures "$BUILD/libVibeSignalCore.dylib"
+verify_arm64_only "$BUILD/VibeSignalApp"
+verify_arm64_only "$BUILD/vibe-signal"
+verify_arm64_only "$BUILD/libVibeSignalCore.dylib"
 
 cp "$BUILD/VibeSignalApp" "$MACOS/VibeSignalApp"
 cp "$BUILD/libVibeSignalCore.dylib" "$MACOS/libVibeSignalCore.dylib"
@@ -174,4 +123,4 @@ fi
 
 echo "$APP"
 echo "$DIST/vibe-signal"
-echo "architectures: $(lipo -archs "$BUILD/VibeSignalApp")"
+echo "architecture: $(lipo -archs "$BUILD/VibeSignalApp")"

@@ -13,6 +13,7 @@ public final class CodexSessionMonitor {
         public var idleTTL: Int
         public var refreshInterval: TimeInterval
         public var staleAfter: TimeInterval
+        public var desktopOrphanGrace: TimeInterval
         public var maxIncrementalBytes: UInt64
         public var maxBufferedLineBytes: Int
         public var maxSessionIndexBytes: UInt64
@@ -30,8 +31,9 @@ public final class CodexSessionMonitor {
             idleTTL: Int = 900_000,
             refreshInterval: TimeInterval = 30,
             staleAfter: TimeInterval = 30 * 60,
+            desktopOrphanGrace: TimeInterval = 5,
             maxIncrementalBytes: UInt64 = 4_000_000,
-            maxBufferedLineBytes: Int = 1_000_000,
+            maxBufferedLineBytes: Int = 16_000_000,
             maxSessionIndexBytes: UInt64 = 4_000_000,
             blockedEmitDelay: TimeInterval = 2
         ) {
@@ -46,6 +48,7 @@ public final class CodexSessionMonitor {
             self.idleTTL = idleTTL
             self.refreshInterval = refreshInterval
             self.staleAfter = staleAfter
+            self.desktopOrphanGrace = desktopOrphanGrace
             self.maxIncrementalBytes = maxIncrementalBytes
             self.maxBufferedLineBytes = maxBufferedLineBytes
             self.maxSessionIndexBytes = maxSessionIndexBytes
@@ -76,9 +79,10 @@ public final class CodexSessionMonitor {
         var sidebarTitle: String?
         var workspace: String?
         var isSubagent = false
+        var originator: String?
         var approvalPolicy: String?
         var approvalsReviewer: String?
-        var activeTurnIDs: Set<String> = []
+        var activeTurnID: String?
         var pendingInteractions: [String: PendingInteraction] = [:]
         var state: SignalState = .unknown
         var reason: String = SignalReason.sessionStart
@@ -92,8 +96,12 @@ public final class CodexSessionMonitor {
         var stateEvidence: String = "unconfirmed"
         var stateCertainty: String = "unknown"
 
+        var hasUnfinishedTurn: Bool {
+            activeTurnID != nil
+        }
+
         var isActive: Bool {
-            state.isActive && !activeTurnIDs.isEmpty
+            state.isActive && hasUnfinishedTurn
         }
     }
 
@@ -116,17 +124,22 @@ public final class CodexSessionMonitor {
     }
 
     private struct SeedActivity {
-        var state: SignalState
         var reason: String
         var message: String
         var timestamp: Date?
-        var interaction: PendingInteraction?
+    }
+
+    private struct SeedTurnContext {
+        var turnID: String?
+        var approvalPolicy: String?
+        var approvalsReviewer: String?
     }
 
     private struct SeedSummary {
         var state: SignalState
         var reason: String
         var message: String
+        var title: String?
         var turnID: String?
         var startedAt: Date?
         var updatedAt: Date?
@@ -143,12 +156,15 @@ public final class CodexSessionMonitor {
         var approvalCandidate: PendingInteraction?
         var activeTurnID: String?
         var activeTurnStartedAt: Date?
+        var title: String?
+        var latestTurnContext: SeedTurnContext?
         var approvalPolicy: String?
         var approvalsReviewer: String?
     }
 
     private let configuration: Configuration
     private let emit: (SignalEvent) -> Void
+    private let desktopHostLaunchDates: () -> [Date]?
     private let queue = DispatchQueue(label: "VibeSignal.CodexSessionMonitor")
     private let queueKey = DispatchSpecificKey<Void>()
     private let fileManager: FileManager
@@ -161,14 +177,18 @@ public final class CodexSessionMonitor {
     private var sessionIndexAttributes: FileAttributes?
     private var lastDiscoveryAt: Date?
     private var lastFullDiscoveryAt: Date?
+    private var currentDesktopHostLaunchDates: [Date]?
+    private var desktopHostMissingSince: Date?
 
     public init(
         configuration: Configuration = Configuration(),
         fileManager: FileManager = .default,
+        desktopHostLaunchDates: @escaping () -> [Date]? = { nil },
         emit: @escaping (SignalEvent) -> Void
     ) {
         self.configuration = configuration
         self.fileManager = fileManager
+        self.desktopHostLaunchDates = desktopHostLaunchDates
         self.emit = emit
         queue.setSpecific(key: queueKey, value: ())
     }
@@ -220,6 +240,7 @@ public final class CodexSessionMonitor {
     }
 
     private func poll(now: Date, forceDiscovery: Bool) {
+        sampleDesktopHostState(now: now)
         refreshSidebarTitles(now: now)
 
         if forceDiscovery || shouldDiscover(now: now) {
@@ -275,7 +296,7 @@ public final class CodexSessionMonitor {
             sessions[sessionID] = session
 
             if session.lastEmittedAt != nil, !session.isSubagent {
-                emitSession(sessionID, now: now, force: true)
+                emitSession(sessionID, now: now)
             }
         }
     }
@@ -514,6 +535,7 @@ public final class CodexSessionMonitor {
                 files.removeValue(forKey: key)
                 return
             }
+            tracked.pendingText = trailingPartialLine(from: tracked.url, size: attributes.size)
             tracked.offset = attributes.size
             tracked.seeded = true
             tracked.hasUnprocessedChanges = false
@@ -529,27 +551,17 @@ public final class CodexSessionMonitor {
         }
 
         let remaining = attributes.size - tracked.offset
-        let bytesToRead = min(remaining, configuration.maxIncrementalBytes)
-        let readOffset = attributes.size - bytesToRead
-        let skippedBytes = readOffset > tracked.offset
+        let bytesToRead = min(remaining, max(1, configuration.maxIncrementalBytes))
 
-        guard let data = readData(from: tracked.url, offset: readOffset, length: bytesToRead) else {
+        guard let data = readData(from: tracked.url, offset: tracked.offset, length: bytesToRead),
+              !data.isEmpty else {
             files[key] = tracked
             return
         }
 
-        tracked.offset = attributes.size
-        tracked.hasUnprocessedChanges = false
-        if skippedBytes {
-            tracked.pendingText = ""
-        }
-
-        processIncrementalData(
-            data,
-            tracked: &tracked,
-            now: now,
-            skipLeadingPartialLine: skippedBytes
-        )
+        tracked.offset += UInt64(data.count)
+        tracked.hasUnprocessedChanges = tracked.offset < attributes.size
+        processIncrementalData(data, tracked: &tracked, now: now)
 
         files[key] = tracked
     }
@@ -578,16 +590,15 @@ public final class CodexSessionMonitor {
         guard let summary = finalSeedSummaryByScanningBackward(from: tracked.url, size: size) else {
             return false
         }
-        let recoveredTitle = latestTaskTitleByScanningBackward(from: tracked.url, size: size)
 
         let sessionID = currentSessionID(for: tracked)
         updateSession(sessionID) { session in
-            session.title = recoveredTitle ?? session.title
+            session.title = summary.title ?? session.title
             session.approvalPolicy = summary.approvalPolicy ?? session.approvalPolicy
             session.approvalsReviewer = summary.approvalsReviewer
             switch summary.state {
             case .working:
-                session.activeTurnIDs = [summary.turnID ?? "unknown"]
+                session.activeTurnID = summary.turnID ?? "unknown"
                 session.pendingInteractions.removeAll()
                 session.state = .working
                 session.reason = summary.reason
@@ -598,7 +609,7 @@ public final class CodexSessionMonitor {
                 session.stateEvidence = "session_replay"
                 session.stateCertainty = summary.stateCertainty
             case .idle:
-                session.activeTurnIDs.removeAll()
+                session.activeTurnID = nil
                 session.pendingInteractions.removeAll()
                 session.state = .idle
                 session.reason = summary.reason
@@ -609,7 +620,7 @@ public final class CodexSessionMonitor {
                 session.stateEvidence = "session_replay"
                 session.stateCertainty = summary.stateCertainty
             case .blocked:
-                session.activeTurnIDs = [summary.turnID ?? "unknown"]
+                session.activeTurnID = summary.turnID ?? "unknown"
                 session.pendingInteractions.removeAll()
                 if let interaction = summary.interaction {
                     session.pendingInteractions[interaction.id] = interaction
@@ -623,7 +634,7 @@ public final class CodexSessionMonitor {
                 session.stateEvidence = "session_replay"
                 session.stateCertainty = summary.stateCertainty
             case .error:
-                session.activeTurnIDs.removeAll()
+                session.activeTurnID = nil
                 session.pendingInteractions.removeAll()
                 session.state = .error
                 session.reason = summary.reason
@@ -634,7 +645,7 @@ public final class CodexSessionMonitor {
                 session.stateEvidence = "session_replay"
                 session.stateCertainty = summary.stateCertainty
             case .unknown:
-                session.activeTurnIDs.removeAll()
+                session.activeTurnID = nil
                 session.pendingInteractions.removeAll()
                 session.state = .unknown
                 session.reason = summary.reason
@@ -652,52 +663,10 @@ public final class CodexSessionMonitor {
     }
 
     private func seedMetadataFromHead(_ tracked: inout TrackedFile, size: UInt64, now: Date) {
-        let length = min(size, 65_536)
-        guard let data = readData(from: tracked.url, offset: 0, length: length) else {
+        guard let line = firstLine(from: tracked.url, size: size) else {
             return
         }
-
-        let text = String(decoding: data, as: UTF8.self)
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        for lineSubsequence in lines {
-            let line = String(lineSubsequence).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !line.isEmpty,
-                  let record = parser.parse(line) else {
-                continue
-            }
-
-            switch record.kind {
-            case .sessionMeta(let id, let workspace, let isSubagent):
-                tracked.sessionID = id
-                updateSession(id) { session in
-                    session.workspace = workspace ?? session.workspace
-                    session.isSubagent = isSubagent
-                    session.updatedAt = record.timestamp ?? now
-                    session.sessionFile = tracked.url.path
-                }
-            case .turnContext(_, let workspace, let approvalPolicy, let approvalsReviewer):
-                let sessionID = currentSessionID(for: tracked)
-                updateSession(sessionID) { session in
-                    session.workspace = workspace ?? session.workspace
-                    session.approvalPolicy = approvalPolicy ?? session.approvalPolicy
-                    session.approvalsReviewer = approvalsReviewer
-                    session.updatedAt = record.timestamp ?? now
-                    session.sessionFile = tracked.url.path
-                }
-            case .userPrompt(let prompt):
-                guard let title = taskTitle(from: prompt) else {
-                    continue
-                }
-                let sessionID = currentSessionID(for: tracked)
-                updateSession(sessionID) { session in
-                    session.title = title
-                    session.updatedAt = record.timestamp ?? now
-                    session.sessionFile = tracked.url.path
-                }
-            default:
-                continue
-            }
-        }
+        processLine(line, tracked: &tracked, now: now, emitPolicy: .seed)
     }
 
     private func finalSeedSummaryByScanningBackward(from url: URL, size: UInt64) -> SeedSummary? {
@@ -772,6 +741,7 @@ public final class CodexSessionMonitor {
                     state: .idle,
                     reason: reason,
                     message: message,
+                    title: nil,
                     turnID: nil,
                     startedAt: nil,
                     updatedAt: record.timestamp,
@@ -788,6 +758,7 @@ public final class CodexSessionMonitor {
                     state: .error,
                     reason: SignalReason.error,
                     message: message,
+                    title: nil,
                     turnID: nil,
                     startedAt: nil,
                     updatedAt: record.timestamp,
@@ -802,18 +773,29 @@ public final class CodexSessionMonitor {
                 }
                 scanState.activeTurnID = turnID ?? "unknown"
                 scanState.activeTurnStartedAt = record.timestamp
+                if let context = scanState.latestTurnContext,
+                   context.turnID == nil || turnID == nil || context.turnID == turnID {
+                    scanState.approvalPolicy = context.approvalPolicy
+                    scanState.approvalsReviewer = context.approvalsReviewer
+                }
             case .turnContext(let turnID, _, let approvalPolicy, let approvalsReviewer):
-                guard scanState.activeTurnID != nil else {
+                guard let activeTurnID = scanState.activeTurnID else {
+                    if scanState.latestTurnContext == nil {
+                        scanState.latestTurnContext = SeedTurnContext(
+                            turnID: turnID,
+                            approvalPolicy: approvalPolicy,
+                            approvalsReviewer: approvalsReviewer
+                        )
+                    }
                     continue
                 }
                 if let turnID,
-                   scanState.activeTurnID != "unknown",
-                   turnID != scanState.activeTurnID {
+                   activeTurnID != "unknown",
+                   turnID != activeTurnID {
                     continue
                 }
-                scanState.approvalPolicy = approvalPolicy
-                scanState.approvalsReviewer = approvalsReviewer
-                return activeSeedSummary(from: scanState)
+                scanState.approvalPolicy = scanState.approvalPolicy ?? approvalPolicy
+                scanState.approvalsReviewer = scanState.approvalsReviewer ?? approvalsReviewer
             case .blocked(let interactionID, let reason, let message):
                 guard !scanState.resolvedInteractionIDs.contains(interactionID),
                       scanState.unresolvedInteraction == nil else {
@@ -842,12 +824,14 @@ public final class CodexSessionMonitor {
                 }
                 if scanState.lastActivity == nil {
                     scanState.lastActivity = SeedActivity(
-                        state: .working,
                         reason: reason,
                         message: message,
-                        timestamp: record.timestamp,
-                        interaction: nil
+                        timestamp: record.timestamp
                     )
+                }
+            case .userPrompt(let prompt):
+                if scanState.activeTurnID != nil, scanState.title == nil {
+                    scanState.title = taskTitle(from: prompt)
                 }
             default:
                 if scanState.activeTurnID != nil,
@@ -878,9 +862,10 @@ public final class CodexSessionMonitor {
         }
 
         return SeedSummary(
-            state: blocked == nil ? (scanState.lastActivity?.state ?? .working) : .blocked,
+            state: blocked == nil ? .working : .blocked,
             reason: blocked?.reason ?? scanState.lastActivity?.reason ?? SignalReason.thinking,
             message: blocked?.message ?? scanState.lastActivity?.message ?? "Codex is working",
+            title: scanState.title,
             turnID: turnID,
             startedAt: scanState.activeTurnStartedAt,
             updatedAt: blocked?.observedAt
@@ -891,63 +876,6 @@ public final class CodexSessionMonitor {
             approvalsReviewer: scanState.approvalsReviewer,
             stateCertainty: stateCertainty
         )
-    }
-
-    private func latestTaskTitleByScanningBackward(from url: URL, size: UInt64) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return nil
-        }
-        defer {
-            try? handle.close()
-        }
-
-        let chunkSize: UInt64 = 262_144
-        var offset = size
-        var leadingPartialLine = ""
-
-        while offset > 0 {
-            let chunkStart = offset > chunkSize ? offset - chunkSize : 0
-            let length = offset - chunkStart
-            do {
-                try handle.seek(toOffset: chunkStart)
-            } catch {
-                return nil
-            }
-
-            let data = handle.readData(ofLength: Int(length))
-            guard !data.isEmpty else {
-                break
-            }
-
-            let text = String(decoding: data, as: UTF8.self) + leadingPartialLine
-            var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-            if chunkStart > 0 {
-                leadingPartialLine = boundedPendingText(lines.isEmpty ? text : lines.removeFirst())
-            } else {
-                leadingPartialLine = ""
-            }
-
-            for line in lines.reversed() {
-                let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmedLine.isEmpty,
-                      let record = parser.parse(trimmedLine),
-                      case .userPrompt(let prompt) = record.kind else {
-                    continue
-                }
-                if let title = taskTitle(from: prompt) {
-                    return title
-                }
-            }
-
-            offset = chunkStart
-        }
-
-        if !leadingPartialLine.isEmpty,
-           let record = parser.parse(leadingPartialLine),
-           case .userPrompt(let prompt) = record.kind {
-            return taskTitle(from: prompt)
-        }
-        return nil
     }
 
     private func processStreamData(
@@ -1006,18 +934,9 @@ public final class CodexSessionMonitor {
     private func processIncrementalData(
         _ data: Data,
         tracked: inout TrackedFile,
-        now: Date,
-        skipLeadingPartialLine: Bool
+        now: Date
     ) {
-        var text = String(decoding: data, as: UTF8.self)
-        if skipLeadingPartialLine {
-            guard let newlineIndex = text.firstIndex(of: "\n") else {
-                return
-            }
-            text = String(text[text.index(after: newlineIndex)...])
-        }
-
-        text = tracked.pendingText + text
+        let text = tracked.pendingText + String(decoding: data, as: UTF8.self)
         let hasCompleteFinalLine = text.hasSuffix("\n")
         var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
 
@@ -1045,10 +964,11 @@ public final class CodexSessionMonitor {
         }
 
         switch record.kind {
-        case .sessionMeta(let id, let workspace, let isSubagent):
+        case .sessionMeta(let id, let workspace, let originator, let isSubagent):
             tracked.sessionID = id
             updateSession(id) { session in
                 session.workspace = workspace ?? session.workspace
+                session.originator = originator ?? session.originator
                 session.isSubagent = isSubagent
                 session.updatedAt = record.timestamp ?? now
                 session.sessionFile = tracked.url.path
@@ -1080,8 +1000,10 @@ public final class CodexSessionMonitor {
             let normalizedTurnID = turnID ?? "unknown"
             var shouldEmit = false
             updateSession(sessionID) { session in
-                let startsNewWorkingState = session.state != .working || session.activeTurnIDs.isEmpty
-                session.activeTurnIDs.insert(normalizedTurnID)
+                let startsNewWorkingState = session.state != .working || !session.hasUnfinishedTurn
+                // A Codex thread has one foreground turn. If Codex was killed before
+                // writing a terminal record, the next turn supersedes that orphan.
+                session.activeTurnID = normalizedTurnID
                 session.pendingInteractions.removeAll()
                 session.state = .working
                 session.reason = SignalReason.thinking
@@ -1102,7 +1024,7 @@ public final class CodexSessionMonitor {
 
         case .blocked(let interactionID, let reason, let message):
             let sessionID = currentSessionID(for: tracked)
-            guard sessions[sessionID]?.isActive == true else {
+            guard sessions[sessionID]?.hasUnfinishedTurn == true else {
                 return
             }
 
@@ -1129,7 +1051,7 @@ public final class CodexSessionMonitor {
 
         case .approvalCandidate(let interactionID, let message):
             let sessionID = currentSessionID(for: tracked)
-            guard sessions[sessionID]?.isActive == true else {
+            guard sessions[sessionID]?.hasUnfinishedTurn == true else {
                 return
             }
 
@@ -1175,7 +1097,7 @@ public final class CodexSessionMonitor {
 
         case .activity(let resolvedInteractionID, let reason, let message):
             let sessionID = currentSessionID(for: tracked)
-            guard sessions[sessionID]?.isActive == true else {
+            guard sessions[sessionID]?.hasUnfinishedTurn == true else {
                 return
             }
 
@@ -1213,25 +1135,18 @@ public final class CodexSessionMonitor {
                 emitSession(sessionID, now: now)
             }
 
-        case .taskEnded(let turnID, let reason, let message):
+        case .taskEnded(_, let reason, let message):
             let sessionID = currentSessionID(for: tracked)
             updateSession(sessionID) { session in
-                if let turnID {
-                    session.activeTurnIDs.remove(turnID)
-                } else {
-                    session.activeTurnIDs.removeAll()
-                }
-
-                if session.activeTurnIDs.isEmpty {
-                    session.pendingInteractions.removeAll()
-                    session.state = .idle
-                    session.reason = reason
-                    session.message = message
-                    session.startedAt = nil
-                    session.blockedObservedAt = nil
-                    session.stateEvidence = "task_complete"
-                    session.stateCertainty = "verified"
-                }
+                session.activeTurnID = nil
+                session.pendingInteractions.removeAll()
+                session.state = .idle
+                session.reason = reason
+                session.message = message
+                session.startedAt = nil
+                session.blockedObservedAt = nil
+                session.stateEvidence = "task_complete"
+                session.stateCertainty = "verified"
 
                 session.updatedAt = record.timestamp ?? now
                 session.sessionFile = tracked.url.path
@@ -1240,14 +1155,10 @@ public final class CodexSessionMonitor {
                 emitSession(sessionID, now: now)
             }
 
-        case .taskFailed(let turnID, let message):
+        case .taskFailed(_, let message):
             let sessionID = currentSessionID(for: tracked)
             updateSession(sessionID) { session in
-                if let turnID {
-                    session.activeTurnIDs.remove(turnID)
-                } else {
-                    session.activeTurnIDs.removeAll()
-                }
+                session.activeTurnID = nil
                 session.pendingInteractions.removeAll()
                 session.state = .error
                 session.reason = SignalReason.error
@@ -1286,9 +1197,20 @@ public final class CodexSessionMonitor {
         session.sessionFile = tracked.url.path
         sessions[sessionID] = session
 
-        if !isStale(session, now: now),
+        if isDesktopSession(session), currentDesktopHostLaunchDates?.isEmpty == true {
+            // At launch, wait for the host-absence debounce instead of briefly
+            // reviving an unfinished rollout from a process that is already gone.
+            return
+        }
+
+        if !isOrphanedDesktopSession(
+            session,
+            now: now,
+            hostLaunchDates: currentDesktopHostLaunchDates
+        ),
+           !isStale(session, now: now),
            session.state != .blocked || canEmitBlockedSession(session, now: now) {
-            emitSession(sessionID, now: now, force: true)
+            emitSession(sessionID, now: now)
         }
     }
 
@@ -1300,9 +1222,28 @@ public final class CodexSessionMonitor {
                 continue
             }
 
+            if isOrphanedDesktopSession(
+                session,
+                now: now,
+                hostLaunchDates: currentDesktopHostLaunchDates
+            ) {
+                updateSession(sessionID) { session in
+                    session.pendingInteractions.removeAll()
+                    session.state = .unknown
+                    session.reason = SignalReason.interrupted
+                    session.message = "Codex exited before the turn finished"
+                    session.startedAt = nil
+                    session.blockedObservedAt = nil
+                    session.updatedAt = now
+                    session.stateEvidence = "desktop_host_exit"
+                    session.stateCertainty = "inferred"
+                }
+                emitSession(sessionID, now: now)
+                continue
+            }
+
             if isStale(session, now: now) {
                 updateSession(sessionID) { session in
-                    session.activeTurnIDs.removeAll()
                     session.pendingInteractions.removeAll()
                     session.state = .unknown
                     session.reason = SignalReason.stale
@@ -1313,7 +1254,7 @@ public final class CodexSessionMonitor {
                     session.stateEvidence = "stale_timeout"
                     session.stateCertainty = "unknown"
                 }
-                emitSession(sessionID, now: now, force: true)
+                emitSession(sessionID, now: now)
                 continue
             }
 
@@ -1329,7 +1270,7 @@ public final class CodexSessionMonitor {
                     continue
                 }
 
-                emitSession(sessionID, now: now, force: true)
+                emitSession(sessionID, now: now)
                 continue
             }
 
@@ -1338,11 +1279,11 @@ public final class CodexSessionMonitor {
                 continue
             }
 
-            emitSession(sessionID, now: now, force: true)
+            emitSession(sessionID, now: now)
         }
     }
 
-    private func emitSession(_ sessionID: String, now: Date, force: Bool = false) {
+    private func emitSession(_ sessionID: String, now: Date) {
         guard var session = sessions[sessionID],
               !session.isSubagent else {
             return
@@ -1356,7 +1297,7 @@ public final class CodexSessionMonitor {
 
     private func makeSignalEvent(from session: TrackedSession, now: Date) -> SignalEvent {
         var metadata: [String: JSONValue] = [:]
-        if let turnID = session.activeTurnIDs.sorted().last {
+        if let turnID = session.activeTurnID {
             metadata["turn_id"] = .string(turnID)
         }
         if let sessionFile = session.sessionFile {
@@ -1408,6 +1349,55 @@ public final class CodexSessionMonitor {
             return false
         }
         return now.timeIntervalSince(lastFileModificationDate) > configuration.staleAfter
+    }
+
+    private func isOrphanedDesktopSession(
+        _ session: TrackedSession,
+        now: Date,
+        hostLaunchDates: [Date]?
+    ) -> Bool {
+        guard isDesktopSession(session), let hostLaunchDates else {
+            return false
+        }
+
+        let lastFileActivity = session.lastFileModificationDate ?? session.updatedAt
+        guard now.timeIntervalSince(lastFileActivity) >= configuration.desktopOrphanGrace else {
+            return false
+        }
+
+        guard !hostLaunchDates.isEmpty else {
+            guard let desktopHostMissingSince else {
+                return false
+            }
+            return now.timeIntervalSince(desktopHostMissingSince) >= configuration.desktopOrphanGrace
+        }
+
+        // The rollout belongs to a prior desktop process when every currently
+        // running host started after its last confirmed state transition.
+        let clockTolerance: TimeInterval = 2
+        let latestCompatibleLaunch = session.updatedAt.addingTimeInterval(clockTolerance)
+        return hostLaunchDates.allSatisfy { $0 > latestCompatibleLaunch }
+    }
+
+    private func sampleDesktopHostState(now: Date) {
+        currentDesktopHostLaunchDates = desktopHostLaunchDates()
+        guard let currentDesktopHostLaunchDates else {
+            desktopHostMissingSince = nil
+            return
+        }
+
+        if currentDesktopHostLaunchDates.isEmpty {
+            desktopHostMissingSince = desktopHostMissingSince ?? now
+        } else {
+            desktopHostMissingSince = nil
+        }
+    }
+
+    private func isDesktopSession(_ session: TrackedSession) -> Bool {
+        guard let originator = session.originator?.lowercased() else {
+            return false
+        }
+        return originator == "codex desktop" || originator == "codex_work_desktop"
     }
 
     private func canEmitBlockedSession(_ session: TrackedSession, now: Date) -> Bool {
@@ -1525,6 +1515,53 @@ public final class CodexSessionMonitor {
         }
     }
 
+    private func firstLine(from url: URL, size: UInt64) -> String? {
+        guard size > 0,
+              let handle = try? FileHandle(forReadingFrom: url) else {
+            return nil
+        }
+        defer {
+            try? handle.close()
+        }
+
+        let limit = min(size, UInt64(max(1, configuration.maxBufferedLineBytes)))
+        var data = Data()
+        while UInt64(data.count) < limit {
+            let remaining = limit - UInt64(data.count)
+            let chunk = handle.readData(ofLength: Int(min(262_144, remaining)))
+            guard !chunk.isEmpty else {
+                break
+            }
+            data.append(chunk)
+            if let newline = data.firstIndex(of: 0x0A) {
+                return String(decoding: data[..<newline], as: UTF8.self)
+            }
+        }
+
+        guard UInt64(data.count) == size else {
+            return nil
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func trailingPartialLine(from url: URL, size: UInt64) -> String {
+        guard size > 0 else {
+            return ""
+        }
+
+        let length = min(size, UInt64(max(1, configuration.maxBufferedLineBytes)))
+        guard let data = readData(from: url, offset: size - length, length: length),
+              data.last != 0x0A else {
+            return ""
+        }
+
+        let text = String(decoding: data, as: UTF8.self)
+        if let newline = text.lastIndex(of: "\n") {
+            return String(text[text.index(after: newline)...])
+        }
+        return length == size ? text : ""
+    }
+
     private func sessionID(from url: URL) -> String? {
         let name = url.deletingPathExtension().lastPathComponent
         guard name.count >= 36 else {
@@ -1567,7 +1604,7 @@ private struct CodexSidebarIndexRecord: Decodable {
 
 private struct CodexSessionRecord {
     enum Kind {
-        case sessionMeta(id: String, workspace: String?, isSubagent: Bool)
+        case sessionMeta(id: String, workspace: String?, originator: String?, isSubagent: Bool)
         case turnContext(
             turnID: String?,
             workspace: String?,
@@ -1595,6 +1632,12 @@ private final class CodexSessionLineParser {
         return formatter
     }()
 
+    private let dateFormatterWithoutFractionalSeconds: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
     func parse(_ line: String) -> CodexSessionRecord? {
         guard mightContainRelevantRecord(line) else {
             return nil
@@ -1606,7 +1649,9 @@ private final class CodexSessionLineParser {
             return nil
         }
 
-        let timestamp = (object["timestamp"] as? String).flatMap { dateFormatter.date(from: $0) }
+        let timestamp = (object["timestamp"] as? String).flatMap {
+            dateFormatter.date(from: $0) ?? dateFormatterWithoutFractionalSeconds.date(from: $0)
+        }
         let payload = object["payload"] as? [String: Any]
 
         switch recordType {
@@ -1620,6 +1665,7 @@ private final class CodexSessionLineParser {
                 kind: .sessionMeta(
                     id: id,
                     workspace: payload["cwd"] as? String,
+                    originator: payload["originator"] as? String,
                     isSubagent: isSubagentSource(payload["source"])
                 )
             )
@@ -1700,12 +1746,12 @@ private final class CodexSessionLineParser {
             )
 
         case "task_complete", "turn_complete":
-            if let error = payload["error"] as? [String: Any] {
+            if let errorMessage = terminalErrorMessage(payload["error"]) {
                 return CodexSessionRecord(
                     timestamp: timestamp,
                     kind: .taskFailed(
                         turnID: payload["turn_id"] as? String,
-                        message: (error["message"] as? String) ?? "Codex turn failed"
+                        message: errorMessage
                     )
                 )
             }
@@ -2043,6 +2089,23 @@ private final class CodexSessionLineParser {
             return object.keys.allSatisfy { !nonTerminalTypes.contains($0) }
         }
         return true
+    }
+
+    private func terminalErrorMessage(_ value: Any?) -> String? {
+        guard let value, !(value is NSNull) else {
+            return nil
+        }
+        if let flag = value as? Bool {
+            return flag ? "Codex turn failed" : nil
+        }
+        if let message = value as? String {
+            let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "Codex turn failed" : trimmed
+        }
+        if let error = value as? [String: Any] {
+            return (error["message"] as? String) ?? "Codex turn failed"
+        }
+        return "Codex turn failed"
     }
 
     private func activityRecord(

@@ -20,8 +20,8 @@ The app embeds the local status hub described in `ARCHITECTURE.md`. Agents and s
 ./scripts/build-app.sh
 ```
 
-By default the script builds Universal Binaries containing both Apple Silicon
-(`arm64`) and Intel (`x86_64`) slices. It creates:
+The script builds Apple Silicon (`arm64`) binaries. Intel Macs are not
+supported. It creates:
 
 - `dist/Vibe Signal.app`
 - `dist/vibe-signal`
@@ -35,15 +35,6 @@ Launchpad. Regenerate the compiled icon assets independently with:
 ```sh
 ./scripts/generate-app-icon.sh
 ```
-
-For a faster single-architecture development build, override the architecture:
-
-```sh
-VIBE_SIGNAL_ARCHS=arm64 ./scripts/build-app.sh
-```
-
-`TARGET=x86_64-apple-macosx13.0` remains available when an exact Swift target
-triple is required.
 
 Development builds are unsigned by default. If an ad-hoc signature is useful
 for local testing, build with `VIBE_SIGNAL_ADHOC_SIGN=1`. Developer ID signing
@@ -61,7 +52,7 @@ xcrun notarytool store-credentials VibeSignalNotary \
 VIBE_SIGNAL_NOTARY_PROFILE=VibeSignalNotary ./scripts/release-macos.sh
 ```
 
-The release script signs and notarizes both the app and its Universal DMG,
+The release script signs and notarizes both the app and its arm64-only DMG,
 staples their tickets, and runs Gatekeeper assessments. It exits before
 building when no notary profile is configured, so an unnotarized public build
 cannot be produced accidentally.

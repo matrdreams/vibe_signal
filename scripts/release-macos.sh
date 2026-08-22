@@ -9,7 +9,7 @@ SIGNING_IDENTITY="${VIBE_SIGNAL_SIGNING_IDENTITY:-Developer ID Application: Kun 
 NOTARY_PROFILE="${VIBE_SIGNAL_NOTARY_PROFILE:-}"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST")"
 BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO_PLIST")"
-DMG="$DIST/Vibe-Signal-$VERSION-universal.dmg"
+DMG="$DIST/Vibe-Signal-$VERSION-arm64.dmg"
 NOTARY_ARCHIVE="$DIST/Vibe-Signal-$VERSION-notarization.zip"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
@@ -36,6 +36,21 @@ if [[ ! -d "$APP" ]]; then
     echo "Missing app bundle: $APP" >&2
     exit 1
 fi
+
+verify_arm64_only() {
+    local binary="$1"
+    local architectures
+
+    architectures="$(lipo -archs "$binary")"
+    if [[ "$architectures" != "arm64" ]]; then
+        echo "Release binaries must be arm64-only; found '$architectures': $binary" >&2
+        exit 1
+    fi
+}
+
+verify_arm64_only "$APP/Contents/MacOS/libVibeSignalCore.dylib"
+verify_arm64_only "$APP/Contents/MacOS/vibe-signal"
+verify_arm64_only "$APP/Contents/MacOS/VibeSignalApp"
 
 sign() {
     codesign \

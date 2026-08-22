@@ -274,6 +274,60 @@ final class VibeSignalCoreTests: XCTestCase {
         XCTAssertEqual(event?.metadata?["jump_url"], .string("codex://threads/thread-1"))
     }
 
+    func testStatusStoreRejectsLateHookAndOlderEvents() {
+        let store = StatusStore()
+        let now = Date(timeIntervalSince1970: 100)
+        store.apply(SignalEvent(
+            source: "codex",
+            adapter: "codex-session-monitor",
+            sessionId: "thread-1",
+            state: .idle,
+            reason: SignalReason.done,
+            updatedAt: now,
+            metadata: ["state_certainty": .string("verified")]
+        ), now: now)
+
+        store.apply(SignalEvent(
+            source: "codex",
+            adapter: "codex-hooks",
+            sessionId: "thread-1",
+            state: .working,
+            reason: SignalReason.thinking,
+            updatedAt: now.addingTimeInterval(1),
+            metadata: ["state_certainty": .string("candidate")]
+        ), now: now.addingTimeInterval(1))
+        XCTAssertEqual(store.snapshot(now: now.addingTimeInterval(1)).globalState, .idle)
+
+        store.apply(SignalEvent(
+            source: "codex",
+            adapter: "codex-session-monitor",
+            sessionId: "thread-1",
+            state: .working,
+            reason: SignalReason.thinking,
+            updatedAt: now.addingTimeInterval(2)
+        ), now: now.addingTimeInterval(2))
+        store.apply(SignalEvent(
+            source: "codex",
+            adapter: "codex-session-monitor",
+            sessionId: "thread-1",
+            state: .idle,
+            reason: SignalReason.done,
+            updatedAt: now.addingTimeInterval(1)
+        ), now: now.addingTimeInterval(2))
+        XCTAssertEqual(store.snapshot(now: now.addingTimeInterval(2)).globalState, .working)
+
+        store.apply(SignalEvent(
+            source: "codex",
+            adapter: "codex-hooks",
+            sessionId: "thread-1",
+            state: .unknown,
+            reason: SignalReason.sessionEnd,
+            updatedAt: now.addingTimeInterval(3),
+            metadata: ["hook_event": .string("SessionEnd")]
+        ), now: now.addingTimeInterval(3))
+        XCTAssertEqual(store.snapshot(now: now.addingTimeInterval(3)).globalState, .unknown)
+    }
+
     func testCodexSessionMonitorEmitsActiveSeedAndIdleCompletion() throws {
         let codexHome = try makeTemporaryCodexHome()
         let sessionID = "019e5982-0b7c-78e2-a08b-771afa1bc9e4"
@@ -559,8 +613,8 @@ final class VibeSignalCoreTests: XCTestCase {
             sessionID: sessionID,
             lines: [
                 #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5994-bbbb-7444-8555-666677778888","cwd":"/tmp/seeded-auto-review","originator":"codex-tui"}}"#,
-                #"{"timestamp":"2026-05-24T10:22:51.645Z","type":"turn_context","payload":{"turn_id":"turn-seeded-auto","cwd":"/tmp/seeded-auto-review","approval_policy":"on-request","approvals_reviewer":"auto_review"}}"#,
                 #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-seeded-auto"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.648Z","type":"turn_context","payload":{"turn_id":"turn-seeded-auto","cwd":"/tmp/seeded-auto-review","approval_policy":"on-request","approvals_reviewer":"auto_review"}}"#,
                 #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"true\",\"sandbox_permissions\":\"require_escalated\",\"justification\":\"test\"}","call_id":"call-seeded-auto"}}"#
             ]
         )
@@ -848,7 +902,7 @@ final class VibeSignalCoreTests: XCTestCase {
         XCTAssertEqual(events.last?.state, .working)
 
         try appendLine(
-            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"error","message":"Connection failed"}}"#,
+            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-error","error":"Connection failed"}}"#,
             to: sessionFile
         )
         monitor.scanOnceForTesting()
@@ -883,6 +937,290 @@ final class VibeSignalCoreTests: XCTestCase {
         monitor.scanOnceForTesting(now: initial.addingTimeInterval(2))
         XCTAssertEqual(events.last?.state, .unknown)
         XCTAssertEqual(events.last?.reason, SignalReason.stale)
+    }
+
+    func testCodexSessionMonitorRetiresDesktopTurnWhenHostExits() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e6002-3333-7444-8555-666677778888"
+        let sessionFile = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e6002-3333-7444-8555-666677778888","cwd":"/tmp/desktop-exit","originator":"Codex Desktop"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-desktop-exit"}}"#
+            ]
+        )
+
+        var hostLaunchDates: [Date]? = [.distantPast]
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(
+                codexHomeURL: codexHome,
+                refreshInterval: 600,
+                staleAfter: 600,
+                desktopOrphanGrace: 1
+            ),
+            desktopHostLaunchDates: { hostLaunchDates }
+        ) { events.append($0) }
+        let initial = Date()
+
+        monitor.scanOnceForTesting(now: initial)
+        XCTAssertEqual(events.last?.state, .working)
+
+        hostLaunchDates = []
+        monitor.scanOnceForTesting(now: initial.addingTimeInterval(2))
+        XCTAssertEqual(events.last?.state, .working)
+
+        hostLaunchDates = [.distantPast]
+        monitor.scanOnceForTesting(now: initial.addingTimeInterval(3))
+        XCTAssertEqual(events.last?.state, .working)
+
+        hostLaunchDates = []
+        monitor.scanOnceForTesting(now: initial.addingTimeInterval(4))
+        XCTAssertEqual(events.last?.state, .working)
+        monitor.scanOnceForTesting(now: initial.addingTimeInterval(6))
+        XCTAssertEqual(events.last?.state, .unknown)
+        XCTAssertEqual(events.last?.reason, SignalReason.interrupted)
+        XCTAssertEqual(events.last?.metadata?["state_evidence"], .string("desktop_host_exit"))
+
+        hostLaunchDates = [.distantPast]
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:01.000Z","type":"event_msg","payload":{"type":"exec_command_begin","call_id":"call-resumed","turn_id":"turn-desktop-exit"}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting(now: initial.addingTimeInterval(7))
+        XCTAssertEqual(events.last?.state, .working)
+        XCTAssertEqual(events.last?.reason, SignalReason.command)
+    }
+
+    func testCodexSessionMonitorRetiresDesktopTurnFromPreviousHostLaunch() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e6003-3333-7444-8555-666677778888"
+        _ = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e6003-3333-7444-8555-666677778888","cwd":"/tmp/desktop-restart","originator":"codex_work_desktop"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-before-restart"}}"#
+            ]
+        )
+
+        var hostLaunchDates: [Date]? = [.distantPast]
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(
+                codexHomeURL: codexHome,
+                refreshInterval: 600,
+                staleAfter: 600,
+                desktopOrphanGrace: 1
+            ),
+            desktopHostLaunchDates: { hostLaunchDates }
+        ) { events.append($0) }
+        let initial = Date()
+
+        monitor.scanOnceForTesting(now: initial)
+        XCTAssertEqual(events.last?.state, .working)
+
+        hostLaunchDates = [initial.addingTimeInterval(1)]
+        monitor.scanOnceForTesting(now: initial.addingTimeInterval(2))
+        XCTAssertEqual(events.last?.state, .unknown)
+        XCTAssertEqual(events.last?.reason, SignalReason.interrupted)
+    }
+
+    func testCodexSessionMonitorDoesNotApplyDesktopExitToTUISession() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e6005-3333-7444-8555-666677778888"
+        _ = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e6005-3333-7444-8555-666677778888","cwd":"/tmp/tui","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-tui"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(
+                codexHomeURL: codexHome,
+                refreshInterval: 600,
+                staleAfter: 600,
+                desktopOrphanGrace: 1
+            ),
+            desktopHostLaunchDates: { [] }
+        ) { events.append($0) }
+        let initial = Date()
+
+        monitor.scanOnceForTesting(now: initial)
+        monitor.scanOnceForTesting(now: initial.addingTimeInterval(2))
+        XCTAssertEqual(events.last?.state, .working)
+    }
+
+    func testCodexSessionMonitorNewTurnSupersedesUnfinishedTurn() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e6004-3333-7444-8555-666677778888"
+        let sessionFile = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e6004-3333-7444-8555-666677778888","cwd":"/tmp/new-turn","originator":"Codex Desktop"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-before-exit"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(codexHomeURL: codexHome)
+        ) { events.append($0) }
+
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .working)
+
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-after-relaunch"}}"#,
+            to: sessionFile
+        )
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:05.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-after-relaunch"}}"#,
+            to: sessionFile
+        )
+        monitor.scanOnceForTesting()
+
+        XCTAssertEqual(events.last?.state, .idle)
+        XCTAssertEqual(events.last?.reason, SignalReason.done)
+    }
+
+    func testCodexSessionMonitorReadsLargeSessionMetadataLine() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e6006-3333-7444-8555-666677778888"
+        let padding = String(repeating: "x", count: 100_000)
+        let metadata = #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"padding":""#
+            + padding
+            + #"","id":"019e6006-3333-7444-8555-666677778888","cwd":"/tmp/large-metadata","originator":"codex-tui"}}"#
+        _ = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                metadata,
+                #"{"timestamp":"2026-05-24T10:22:51Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-large-metadata"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(codexHomeURL: codexHome)
+        ) { events.append($0) }
+
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .working)
+        XCTAssertEqual(events.last?.workspace, "/tmp/large-metadata")
+        XCTAssertEqual(
+            events.last?.startedAt,
+            ISO8601DateFormatter().date(from: "2026-05-24T10:22:51Z")
+        )
+    }
+
+    func testCodexSessionMonitorCompletesRecordSplitAcrossStartup() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e6009-3333-7444-8555-666677778888"
+        let sessionFile = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e6009-3333-7444-8555-666677778888","cwd":"/tmp/partial-record","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-partial"}}"#
+            ]
+        )
+        let completion = #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-partial"}}"#
+        let split = completion.index(completion.startIndex, offsetBy: completion.count / 2)
+        try appendText(String(completion[..<split]), to: sessionFile)
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(codexHomeURL: codexHome)
+        ) { events.append($0) }
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .working)
+
+        try appendText(String(completion[split...]) + "\n", to: sessionFile)
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .idle)
+    }
+
+    func testCodexSessionMonitorDoesNotSkipTaskStartBeforeLargeBurst() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e6007-3333-7444-8555-666677778888"
+        let sessionFile = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e6007-3333-7444-8555-666677778888","cwd":"/tmp/large-burst","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-old"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:52.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-old"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(codexHomeURL: codexHome)
+        ) { events.append($0) }
+        monitor.scanOnceForTesting()
+        XCTAssertTrue(events.isEmpty)
+
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-large-burst"}}"#,
+            to: sessionFile
+        )
+        let largeOutput = String(repeating: "x", count: 5_000_000)
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:01.000Z","type":"response_item","payload":{"type":"output_text","text":""#
+                + largeOutput
+                + #""}}"#,
+            to: sessionFile
+        )
+
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .working)
+    }
+
+    func testCodexSessionMonitorResolvesInteractionAcrossLargeLineChunks() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e6008-3333-7444-8555-666677778888"
+        let sessionFile = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e6008-3333-7444-8555-666677778888","cwd":"/tmp/large-line","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-large-line"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:52.000Z","type":"event_msg","payload":{"type":"request_user_input","call_id":"call-large-line","turn_id":"turn-large-line","isBlocking":true}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(
+                codexHomeURL: codexHome,
+                refreshInterval: 600,
+                maxIncrementalBytes: 400_000,
+                blockedEmitDelay: 0
+            )
+        ) { events.append($0) }
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.state, .blocked)
+
+        let largeOutput = String(repeating: "x", count: 1_200_000)
+        try appendLine(
+            #"{"timestamp":"2026-05-24T10:23:00.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-large-line","output":""#
+                + largeOutput
+                + #""}}"#,
+            to: sessionFile
+        )
+        for _ in 0..<4 {
+            monitor.scanOnceForTesting()
+        }
+
+        XCTAssertEqual(events.last?.state, .working)
+        XCTAssertEqual(events.last?.reason, SignalReason.tool)
     }
 
     func testCodexSessionMonitorSeedFindsCompletionBeforeLargeNoisyTail() throws {
@@ -939,11 +1277,15 @@ final class VibeSignalCoreTests: XCTestCase {
     }
 
     private func appendLine(_ line: String, to file: URL) throws {
+        try appendText(line + "\n", to: file)
+    }
+
+    private func appendText(_ text: String, to file: URL) throws {
         let handle = try FileHandle(forWritingTo: file)
         defer {
             try? handle.close()
         }
         try handle.seekToEnd()
-        handle.write(Data((line + "\n").utf8))
+        handle.write(Data(text.utf8))
     }
 }

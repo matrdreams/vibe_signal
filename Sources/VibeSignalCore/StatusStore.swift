@@ -37,6 +37,10 @@ public final class StatusStore {
         let publishedSnapshot: SignalSnapshot? = queue.sync {
             var mergedEvent = event
             if let previousEvent = eventsByKey[event.sessionKey] {
+                guard shouldReplace(previousEvent, with: event, now: now) else {
+                    return nil
+                }
+
                 mergedEvent.title = mergedEvent.title ?? previousEvent.title
                 mergedEvent.workspace = mergedEvent.workspace ?? previousEvent.workspace
 
@@ -113,6 +117,39 @@ public final class StatusStore {
             now: now,
             maxSessions: configuration.maxSessions
         )
+    }
+
+    private func shouldReplace(
+        _ previous: SignalEvent,
+        with event: SignalEvent,
+        now: Date
+    ) -> Bool {
+        guard !previous.isExpired(now: now) else {
+            return true
+        }
+        guard event.updatedAt >= previous.updatedAt else {
+            return false
+        }
+        guard event.adapter != previous.adapter else {
+            return true
+        }
+        if adapterRank(event.adapter) >= adapterRank(previous.adapter) {
+            return true
+        }
+        return event.adapter == "codex-hooks"
+            && event.reason == SignalReason.sessionEnd
+            && (previous.state == .working || previous.state == .blocked)
+    }
+
+    private func adapterRank(_ adapter: String) -> Int {
+        switch adapter {
+        case "codex-session-monitor":
+            return 2
+        case "codex-hooks", "codex-notify":
+            return 1
+        default:
+            return 0
+        }
     }
 
     private func publishIfChanged(_ snapshot: SignalSnapshot) -> SignalSnapshot? {

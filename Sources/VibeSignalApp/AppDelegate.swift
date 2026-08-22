@@ -25,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             configureStoreCallback()
             try startHub()
             store.removeEvents(source: "codex", adapter: "codex-session-monitor")
+            store.removeEvents(source: "codex", adapter: "codex-hooks")
             startCodexMonitor()
             initialSnapshot = store.snapshot()
         } catch let error as VibeSignalError where error.isSocketOwnershipConflict {
@@ -74,7 +75,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     private func startCodexMonitor() {
-        let monitor = CodexSessionMonitor { [weak self] event in
+        let monitor = CodexSessionMonitor(
+            desktopHostLaunchDates: {
+                let applications = NSRunningApplication
+                    .runningApplications(withBundleIdentifier: "com.openai.codex")
+                    .filter { !$0.isTerminated }
+                guard !applications.isEmpty else {
+                    return []
+                }
+
+                let launchDates = applications.compactMap(\.launchDate)
+                // A running host with no launch date is still evidence that the
+                // producer exists, so do not retire its sessions on that basis.
+                return launchDates.isEmpty ? [.distantPast] : launchDates
+            }
+        ) { [weak self] event in
             self?.store.apply(event)
         }
         monitor.start()
