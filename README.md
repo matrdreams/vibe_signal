@@ -55,7 +55,11 @@ VIBE_SIGNAL_NOTARY_PROFILE=VibeSignalNotary ./scripts/release-macos.sh
 The release script signs and notarizes both the app and its arm64-only DMG,
 staples their tickets, and runs Gatekeeper assessments. It exits before
 building when no notary profile is configured, so an unnotarized public build
-cannot be produced accidentally.
+cannot be produced accidentally. After a successful release, it removes the
+loose `dist/Vibe Signal.app` bundle so macOS Apps/Launchpad cannot index the
+build artifact as a second installed copy. Set
+`VIBE_SIGNAL_KEEP_RELEASE_APP=1` only when that loose bundle is needed for
+debugging.
 
 Launch the app from Finder or with:
 

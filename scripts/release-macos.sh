@@ -12,6 +12,7 @@ BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO_PLIST
 DMG="$DIST/Vibe-Signal-$VERSION-arm64.dmg"
 NOTARY_ARCHIVE="$DIST/Vibe-Signal-$VERSION-notarization.zip"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+KEEP_RELEASE_APP="${VIBE_SIGNAL_KEEP_RELEASE_APP:-0}"
 
 if [[ -z "$NOTARY_PROFILE" ]]; then
     cat >&2 <<'EOF'
@@ -114,7 +115,17 @@ xcrun stapler staple "$DMG"
 xcrun stapler validate "$DMG"
 spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG"
 
-echo "app: $APP"
+if [[ "$KEEP_RELEASE_APP" != "1" ]]; then
+    if [[ -x "$LSREGISTER" ]]; then
+        "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true
+    fi
+    rm -r "$APP"
+    APP_RESULT="packaged inside $DMG (loose app removed)"
+else
+    APP_RESULT="$APP"
+fi
+
+echo "app: $APP_RESULT"
 echo "dmg: $DMG"
 echo "version: $VERSION ($BUILD_NUMBER)"
 echo "sha256: $(shasum -a 256 "$DMG" | awk '{print $1}')"
