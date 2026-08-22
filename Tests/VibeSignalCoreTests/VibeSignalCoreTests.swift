@@ -8,7 +8,7 @@ final class VibeSignalCoreTests: XCTestCase {
         XCTAssertEqual(snapshot.globalState, .unknown)
     }
 
-    func testUnknownSessionPreventsUnverifiedGlobalWorkingOrIdle() {
+    func testKnownActiveSessionOutranksUnknownWhileIdleDoesNot() {
         let now = Date()
         let unknown = SignalEvent(
             source: "codex",
@@ -27,7 +27,17 @@ final class VibeSignalCoreTests: XCTestCase {
             updatedAt: now
         )
 
-        XCTAssertEqual(SignalSnapshot.make(from: [working, unknown], now: now).globalState, .unknown)
+        let idle = SignalEvent(
+            source: "codex",
+            adapter: "test",
+            sessionId: "idle",
+            state: .idle,
+            reason: SignalReason.done,
+            updatedAt: now
+        )
+
+        XCTAssertEqual(SignalSnapshot.make(from: [working, unknown], now: now).globalState, .working)
+        XCTAssertEqual(SignalSnapshot.make(from: [idle, unknown], now: now).globalState, .unknown)
     }
 
     func testGlobalStatePriority() {
@@ -158,6 +168,14 @@ final class VibeSignalCoreTests: XCTestCase {
         XCTAssertEqual(event.state, .working)
         XCTAssertEqual(event.reason, SignalReason.approval)
         XCTAssertNil(event.metadata?["tool_input"])
+    }
+
+    func testCodexHookBridgeIgnoresSubagentSessions() throws {
+        let input = Data(#"{"session_id":"thread-child","turn_id":"turn-child","agent_id":"agent-child","agent_type":"guardian","cwd":"/tmp/project","hook_event_name":"UserPromptSubmit","prompt":"private prompt"}"#.utf8)
+        XCTAssertNil(try CodexHookBridge.makeEvent(from: input))
+
+        let subagentStart = Data(#"{"session_id":"thread-root","turn_id":"turn-root","agent_id":"agent-child","agent_type":"guardian","cwd":"/tmp/project","hook_event_name":"SubagentStart"}"#.utf8)
+        XCTAssertNil(try CodexHookBridge.makeEvent(from: subagentStart))
     }
 
     func testCodexHookConfigurationPreservesExistingHooks() throws {
@@ -304,6 +322,63 @@ final class VibeSignalCoreTests: XCTestCase {
         XCTAssertEqual(events.last?.sessionId, sessionID)
         XCTAssertEqual(events.last?.state, .idle)
         XCTAssertEqual(events.last?.message, "Turn finished")
+    }
+
+    func testCodexSessionMonitorUsesAndRefreshesCodexSidebarTitle() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e5982-1111-7222-8333-444455556666"
+        _ = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5982-1111-7222-8333-444455556666","cwd":"/tmp/sidebar","originator":"Codex Desktop","source":"vscode"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.645Z","type":"event_msg","payload":{"type":"user_message","message":"Raw user prompt that does not match the sidebar"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(
+                codexHomeURL: codexHome,
+                refreshInterval: 600
+            )
+        ) { events.append($0) }
+
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.title, "Raw user prompt that does not match the sidebar")
+
+        let indexURL = codexHome.appendingPathComponent("session_index.jsonl")
+        let indexLine = #"{"id":"019e5982-1111-7222-8333-444455556666","thread_name":"Canonical Sidebar Title","updated_at":"2026-05-24T10:22:52Z"}"# + "\n"
+        try Data(indexLine.utf8).write(to: indexURL)
+
+        monitor.scanOnceForTesting()
+        XCTAssertEqual(events.last?.title, "Canonical Sidebar Title")
+        XCTAssertEqual(
+            events.last?.metadata?["title_source"],
+            .string("codex_session_index")
+        )
+    }
+
+    func testCodexSessionMonitorDoesNotEmitInternalSubagentAsSidebarSession() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e5982-7777-7888-8999-000011112222"
+        _ = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5982-7777-7888-8999-000011112222","cwd":"/tmp/sidebar","originator":"Codex Desktop","source":{"subagent":{"other":"guardian"}}}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-subagent"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(codexHomeURL: codexHome)
+        ) { events.append($0) }
+
+        monitor.scanOnceForTesting()
+        XCTAssertTrue(events.isEmpty)
     }
 
     func testCodexSessionMonitorDoesNotEmitCompletedSeededSession() throws {

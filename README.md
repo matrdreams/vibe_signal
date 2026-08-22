@@ -3,9 +3,9 @@
 Vibe Signal is a native macOS menu bar app that shows a traffic-light status for local coding agents.
 
 - Red: an agent is blocked on approval or user input.
-- Yellow: an agent is working.
+- Yellow: at least one verified agent is working, unless another task needs input or has failed.
 - Green: every observed session has a confirmed completed/interrupted turn.
-- Gray: no session is known, or at least one state cannot be verified.
+- Gray: no session is known, or no task is active and at least one state cannot be verified.
 
 Each session row shows its task title, latest state, and elapsed time. Click the
 row—or a macOS notification—to return to that exact Codex conversation. The app
@@ -69,7 +69,7 @@ cannot be produced accidentally.
 Launch the app from Finder or with:
 
 ```sh
-open "dist/Vibe Signal.app"
+"./dist/Vibe Signal.app/Contents/MacOS/VibeSignalApp" &
 ```
 
 ## Emit Status
@@ -164,9 +164,12 @@ Custom adapters can still call `vibe-signal emit` at explicit lifecycle points:
 ./dist/vibe-signal emit --source codex --adapter codex-hooks --state idle --reason done --message "Turn finished"
 ```
 
-The monitor extracts a concise title from the latest user prompt and attaches
-the `codex://threads/<session-id>` deep link. Notification types can be switched
-on or off in Settings.
+The monitor uses Codex's `session_index.jsonl` title so menu rows match the
+Codex sidebar, falling back to a concise title from the latest user prompt
+until the sidebar title is available. Internal subagent rollouts are not shown
+as separate sidebar sessions. Each root session still carries the
+`codex://threads/<session-id>` deep link. Notification types can be switched on
+or off in Settings.
 
 When the menu bar app is not running, the CLI writes the snapshot file and reports that the hub is offline. Once the app starts, it loads that snapshot and then listens on the socket for live events.
 

@@ -174,15 +174,15 @@ Hub 需要维护所有 session 的最新状态，然后归约成一个菜单栏�
 优先级：
 
 ```text
-blocked > error > unknown > working > idle
+blocked > error > working > unknown > idle
 ```
 
 建议规则：
 
 1. 只考虑未过期 session。
 2. 任意 session 为 `blocked`，全局状态就是红色。
-3. 没有 blocked/error，但任意 session 无法验证时，全局状态为灰色；不能用一个已知 working/idle 掩盖另一个未知 session。
-4. 所有 session 都可验证，且至少一个为 `working` 时，全局状态为黄色。
+3. 没有 blocked/error，但至少一个已验证 session 为 `working` 时，全局状态为黄色；瞬时未知 session 不能掩盖正在运行的任务。
+4. 没有活动任务、但任意 session 无法验证时，全局状态为灰色；未知状态仍然不能被一个已知 `idle` 掩盖。
 5. 所有有效 session 都是已确认的 `idle` 时，全局状态才是绿色。
 6. 没有有效 session 时显示灰色，绝不从“没有事件”推断绿色。
 
@@ -275,6 +275,8 @@ Hook 不能单独证明红灯或绿灯。官方 `PermissionRequest` 在审批路
 
 会话事件监控器的确认规则：
 
+- `~/.codex/session_index.jsonl` 的 `thread_name` 是菜单会话标题的首选来源，确保与 Codex sidebar 一致；索引标题尚未生成时才回退到最近用户输入。
+- `session_meta.payload.source.subagent` 明确标记的内部 subagent rollout 不作为顶层 sidebar 会话展示；根会话仍负责承载整体任务状态。
 - `task_started` / `turn_started` → 黄色。
 - `task_complete` / `turn_complete` → 绿色；携带 terminal error 时 → error。
 - `turn_aborted` → 绿色，reason 为 `interrupted`。

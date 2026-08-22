@@ -15,6 +15,7 @@ public final class CodexSessionMonitor {
         public var staleAfter: TimeInterval
         public var maxIncrementalBytes: UInt64
         public var maxBufferedLineBytes: Int
+        public var maxSessionIndexBytes: UInt64
         public var blockedEmitDelay: TimeInterval
 
         public init(
@@ -31,6 +32,7 @@ public final class CodexSessionMonitor {
             staleAfter: TimeInterval = 30 * 60,
             maxIncrementalBytes: UInt64 = 4_000_000,
             maxBufferedLineBytes: Int = 1_000_000,
+            maxSessionIndexBytes: UInt64 = 4_000_000,
             blockedEmitDelay: TimeInterval = 2
         ) {
             self.codexHomeURL = codexHomeURL
@@ -46,6 +48,7 @@ public final class CodexSessionMonitor {
             self.staleAfter = staleAfter
             self.maxIncrementalBytes = maxIncrementalBytes
             self.maxBufferedLineBytes = maxBufferedLineBytes
+            self.maxSessionIndexBytes = maxSessionIndexBytes
             self.blockedEmitDelay = blockedEmitDelay
         }
     }
@@ -70,7 +73,9 @@ public final class CodexSessionMonitor {
     private struct TrackedSession {
         var id: String
         var title: String?
+        var sidebarTitle: String?
         var workspace: String?
+        var isSubagent = false
         var approvalPolicy: String?
         var approvalsReviewer: String?
         var activeTurnIDs: Set<String> = []
@@ -152,6 +157,8 @@ public final class CodexSessionMonitor {
     private var timer: DispatchSourceTimer?
     private var files: [String: TrackedFile] = [:]
     private var sessions: [String: TrackedSession] = [:]
+    private var sidebarTitles: [String: String] = [:]
+    private var sessionIndexAttributes: FileAttributes?
     private var lastDiscoveryAt: Date?
     private var lastFullDiscoveryAt: Date?
 
@@ -213,6 +220,8 @@ public final class CodexSessionMonitor {
     }
 
     private func poll(now: Date, forceDiscovery: Bool) {
+        refreshSidebarTitles(now: now)
+
         if forceDiscovery || shouldDiscover(now: now) {
             discoverFiles(now: now, forceFullTree: forceDiscovery)
         }
@@ -232,6 +241,87 @@ public final class CodexSessionMonitor {
             return true
         }
         return now.timeIntervalSince(lastDiscoveryAt) >= configuration.discoveryInterval
+    }
+
+    private func refreshSidebarTitles(now: Date) {
+        let indexURL = configuration.codexHomeURL.appendingPathComponent("session_index.jsonl")
+        guard let attributes = fileAttributes(for: indexURL) else {
+            return
+        }
+
+        if let sessionIndexAttributes,
+           sessionIndexAttributes.size == attributes.size,
+           sessionIndexAttributes.modifiedAt == attributes.modifiedAt {
+            return
+        }
+
+        guard let loadedTitles = loadSidebarTitles(from: indexURL, size: attributes.size) else {
+            // Codex can be in the middle of appending the final JSONL record.
+            // Keep the prior index snapshot and retry on the next poll.
+            return
+        }
+
+        sessionIndexAttributes = attributes
+        let changedSessionIDs = Set(sidebarTitles.keys)
+            .union(loadedTitles.keys)
+            .filter { sidebarTitles[$0] != loadedTitles[$0] }
+        sidebarTitles = loadedTitles
+
+        for sessionID in changedSessionIDs {
+            guard var session = sessions[sessionID] else {
+                continue
+            }
+            session.sidebarTitle = loadedTitles[sessionID]
+            sessions[sessionID] = session
+
+            if session.lastEmittedAt != nil, !session.isSubagent {
+                emitSession(sessionID, now: now, force: true)
+            }
+        }
+    }
+
+    private func loadSidebarTitles(from url: URL, size: UInt64) -> [String: String]? {
+        guard size > 0 else {
+            return [:]
+        }
+
+        let length = min(size, configuration.maxSessionIndexBytes)
+        guard length > 0 else {
+            return [:]
+        }
+
+        let offset = size - length
+        guard let data = readData(from: url, offset: offset, length: length),
+              data.last == 0x0A else {
+            return nil
+        }
+
+        var text = String(decoding: data, as: UTF8.self)
+        if offset > 0 {
+            guard let firstNewline = text.firstIndex(of: "\n") else {
+                return [:]
+            }
+            text = String(text[text.index(after: firstNewline)...])
+        }
+
+        var titles: [String: String] = [:]
+        let decoder = JSONDecoder()
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let record = try? decoder.decode(
+                CodexSidebarIndexRecord.self,
+                from: Data(line.utf8)
+            ) else {
+                continue
+            }
+
+            let id = record.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = record.threadName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, !title.isEmpty else {
+                continue
+            }
+            titles[id] = title
+        }
+        return titles
     }
 
     private func discoverFiles(now: Date, forceFullTree: Bool) {
@@ -577,10 +667,11 @@ public final class CodexSessionMonitor {
             }
 
             switch record.kind {
-            case .sessionMeta(let id, let workspace):
+            case .sessionMeta(let id, let workspace, let isSubagent):
                 tracked.sessionID = id
                 updateSession(id) { session in
                     session.workspace = workspace ?? session.workspace
+                    session.isSubagent = isSubagent
                     session.updatedAt = record.timestamp ?? now
                     session.sessionFile = tracked.url.path
                 }
@@ -954,10 +1045,11 @@ public final class CodexSessionMonitor {
         }
 
         switch record.kind {
-        case .sessionMeta(let id, let workspace):
+        case .sessionMeta(let id, let workspace, let isSubagent):
             tracked.sessionID = id
             updateSession(id) { session in
                 session.workspace = workspace ?? session.workspace
+                session.isSubagent = isSubagent
                 session.updatedAt = record.timestamp ?? now
                 session.sessionFile = tracked.url.path
             }
@@ -1183,7 +1275,8 @@ public final class CodexSessionMonitor {
     private func emitSeededActiveSession(from tracked: TrackedFile, modifiedAt: Date?, now: Date) {
         let sessionID = currentSessionID(for: tracked)
         guard var session = sessions[sessionID],
-              session.isActive else {
+              session.isActive,
+              !session.isSubagent else {
             return
         }
 
@@ -1202,7 +1295,8 @@ public final class CodexSessionMonitor {
     private func refreshActiveSessions(now: Date) {
         for sessionID in Array(sessions.keys) {
             guard let session = sessions[sessionID],
-                  session.isActive else {
+                  session.isActive,
+                  !session.isSubagent else {
                 continue
             }
 
@@ -1249,7 +1343,8 @@ public final class CodexSessionMonitor {
     }
 
     private func emitSession(_ sessionID: String, now: Date, force: Bool = false) {
-        guard var session = sessions[sessionID] else {
+        guard var session = sessions[sessionID],
+              !session.isSubagent else {
             return
         }
 
@@ -1277,12 +1372,15 @@ public final class CodexSessionMonitor {
         if let approvalsReviewer = session.approvalsReviewer {
             metadata["approvals_reviewer"] = .string(approvalsReviewer)
         }
+        if session.sidebarTitle != nil {
+            metadata["title_source"] = .string("codex_session_index")
+        }
 
         return SignalEvent(
             source: "codex",
             adapter: "codex-session-monitor",
             sessionId: session.id,
-            title: session.title,
+            title: session.sidebarTitle ?? session.title,
             workspace: session.workspace,
             state: session.state,
             reason: session.reason,
@@ -1324,6 +1422,7 @@ public final class CodexSessionMonitor {
 
     private func updateSession(_ sessionID: String, update: (inout TrackedSession) -> Void) {
         var session = sessions[sessionID] ?? TrackedSession(id: sessionID)
+        session.sidebarTitle = sidebarTitles[sessionID]
         update(&session)
         sessions[sessionID] = session
     }
@@ -1456,9 +1555,19 @@ public final class CodexSessionMonitor {
     }
 }
 
+private struct CodexSidebarIndexRecord: Decodable {
+    var id: String
+    var threadName: String
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case threadName = "thread_name"
+    }
+}
+
 private struct CodexSessionRecord {
     enum Kind {
-        case sessionMeta(id: String, workspace: String?)
+        case sessionMeta(id: String, workspace: String?, isSubagent: Bool)
         case turnContext(
             turnID: String?,
             workspace: String?,
@@ -1508,7 +1617,11 @@ private final class CodexSessionLineParser {
             }
             return CodexSessionRecord(
                 timestamp: timestamp,
-                kind: .sessionMeta(id: id, workspace: payload["cwd"] as? String)
+                kind: .sessionMeta(
+                    id: id,
+                    workspace: payload["cwd"] as? String,
+                    isSubagent: isSubagentSource(payload["source"])
+                )
             )
 
         case "turn_context":
@@ -1551,6 +1664,16 @@ private final class CodexSessionLineParser {
         return relevantTypes.contains(where: { serializedType($0, appearsIn: line) })
             || line.contains(#""role":"user""#)
             || line.contains(#""role": "user""#)
+    }
+
+    private func isSubagentSource(_ source: Any?) -> Bool {
+        if let source = source as? String {
+            return source == "subagent"
+        }
+        guard let source = source as? [String: Any] else {
+            return false
+        }
+        return source["subagent"] != nil
     }
 
     private func serializedType(_ type: String, appearsIn line: String) -> Bool {

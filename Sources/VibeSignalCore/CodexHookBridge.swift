@@ -9,6 +9,15 @@ public enum CodexHookBridge {
             return nil
         }
 
+        let isSubagentEvent = eventName == "SubagentStart" || eventName == "SubagentStop"
+        let hasSubagentID = (payload["agent_id"] as? String)?.isEmpty == false
+        guard !isSubagentEvent, !hasSubagentID else {
+            // Root rollouts remain the status anchor. Publishing child hook
+            // events as standalone sessions creates rows that do not exist in
+            // the Codex sidebar.
+            return nil
+        }
+
         let mapping: (state: SignalState, reason: String, message: String, ttl: Int)
         switch eventName {
         case "UserPromptSubmit":
@@ -24,12 +33,10 @@ public enum CodexHookBridge {
             mapping = toolMapping(payload: payload, prefix: "Processing")
         case "PreCompact", "PostCompact":
             mapping = (.working, SignalReason.thinking, "Compacting conversation context", 30_000)
-        case "Stop", "SubagentStop":
+        case "Stop":
             // Another Stop hook can still continue the turn. The rollout's
             // task_complete event is the authority for green/idle.
             mapping = (.working, SignalReason.thinking, "Finishing Codex turn", 15_000)
-        case "SubagentStart":
-            mapping = (.working, SignalReason.tool, "Running Codex subtask", 30_000)
         case "SessionStart":
             mapping = (.unknown, SignalReason.sessionStart, "Session opened; waiting for turn state", 60_000)
         case "SessionEnd":

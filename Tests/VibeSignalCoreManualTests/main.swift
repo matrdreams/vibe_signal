@@ -101,7 +101,18 @@ let unknown = SignalEvent(
     updatedAt: now
 )
 let uncertainSnapshot = SignalSnapshot.make(from: [working, unknown], now: now)
-assertEqual(uncertainSnapshot.globalState, .unknown, "unknown should prevent an unverified global colour")
+assertEqual(uncertainSnapshot.globalState, .working, "verified working should outrank a transient unknown session")
+
+let uncertainIdle = SignalEvent(
+    source: "codex",
+    adapter: "test",
+    sessionId: "idle",
+    state: .idle,
+    reason: SignalReason.done,
+    updatedAt: now
+)
+let uncertainIdleSnapshot = SignalSnapshot.make(from: [uncertainIdle, unknown], now: now)
+assertEqual(uncertainIdleSnapshot.globalState, .unknown, "unknown should still prevent an unverified green state")
 
 let expired = SignalEvent(
     source: "codex",
@@ -161,6 +172,10 @@ let permissionHookInput = Data(#"{"session_id":"thread-hook","turn_id":"turn-hoo
 let permissionHookEvent = try CodexHookBridge.makeEvent(from: permissionHookInput, now: now)
 assertEqual(permissionHookEvent?.state, .working, "permission hook alone must not claim user attention")
 assertTrue(permissionHookEvent?.metadata?["tool_input"] == nil, "hook bridge must not forward tool input")
+
+let subagentHookInput = Data(#"{"session_id":"thread-child","turn_id":"turn-child","agent_id":"agent-child","agent_type":"guardian","cwd":"/tmp/hook","hook_event_name":"UserPromptSubmit","prompt":"private prompt"}"#.utf8)
+let subagentHookEvent = try CodexHookBridge.makeEvent(from: subagentHookInput, now: now)
+assertTrue(subagentHookEvent == nil, "subagent hooks should not create standalone sidebar sessions")
 
 let hookConfigRoot = FileManager.default.temporaryDirectory
     .appendingPathComponent("VibeSignalManualTests-Hooks-\(UUID().uuidString)", isDirectory: true)
@@ -254,6 +269,10 @@ defer {
 }
 
 let codexSessionID = "019e5982-0b7c-78e2-a08b-771afa1bc9e4"
+let sidebarIndexLine = #"{"id":"019e5982-0b7c-78e2-a08b-771afa1bc9e4","thread_name":"Sidebar Session Title","updated_at":"2026-05-24T10:22:52Z"}"# + "\n"
+try Data(sidebarIndexLine.utf8).write(
+    to: codexHome.appendingPathComponent("session_index.jsonl")
+)
 let codexSessionFile = try writeSessionFile(
     codexHome: codexHome,
     sessionID: codexSessionID,
@@ -285,6 +304,7 @@ assertTrue(
 )
 assertEqual(recorder.last?.sessionId, codexSessionID, "Codex monitor should preserve session id")
 assertEqual(recorder.last?.workspace, "/tmp/project", "Codex monitor should read workspace")
+assertEqual(recorder.last?.title, "Sidebar Session Title", "Codex monitor should use the Codex sidebar title")
 assertEqual(recorder.last?.message, "Searching the web", "Codex monitor should surface web activity")
 
 try appendLine(
@@ -300,6 +320,35 @@ assertTrue(
 )
 assertEqual(recorder.last?.message, "Turn finished", "Codex monitor should explain completion")
 monitor.stop()
+
+let subagentCodexHome = FileManager.default.temporaryDirectory
+    .appendingPathComponent("VibeSignalManualTests-Subagent-\(UUID().uuidString)", isDirectory: true)
+try FileManager.default.createDirectory(at: subagentCodexHome, withIntermediateDirectories: true)
+defer {
+    try? FileManager.default.removeItem(at: subagentCodexHome)
+}
+_ = try writeSessionFile(
+    codexHome: subagentCodexHome,
+    sessionID: "019e5982-7777-7888-8999-000011112222",
+    lines: [
+        #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5982-7777-7888-8999-000011112222","cwd":"/tmp/subagent","originator":"Codex Desktop","source":{"subagent":{"other":"guardian"}}}}"#,
+        #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-subagent"}}"#
+    ]
+)
+let subagentRecorder = EventRecorder()
+let subagentMonitor = CodexSessionMonitor(
+    configuration: CodexSessionMonitor.Configuration(
+        codexHomeURL: subagentCodexHome,
+        pollInterval: 0.05,
+        discoveryInterval: 0.05
+    )
+) { event in
+    subagentRecorder.append(event)
+}
+subagentMonitor.start()
+Thread.sleep(forTimeInterval: 0.2)
+assertTrue(subagentRecorder.last == nil, "internal subagents should not appear as sidebar sessions")
+subagentMonitor.stop()
 
 let approvalCodexHome = FileManager.default.temporaryDirectory
     .appendingPathComponent("VibeSignalManualTests-Approval-\(UUID().uuidString)", isDirectory: true)

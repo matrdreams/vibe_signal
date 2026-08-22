@@ -13,9 +13,9 @@ public enum SignalState: String, Codable, CaseIterable, Equatable, Sendable {
             return 50
         case .error:
             return 40
-        case .unknown:
-            return 35
         case .working:
+            return 35
+        case .unknown:
             return 30
         case .idle:
             return 20
@@ -229,10 +229,10 @@ public struct SignalSnapshot: Codable, Equatable, Sendable {
             return .unknown
         }
 
-        // Unknown outranks working and idle because a definitive global colour
-        // must account for every observed session. A verified blocked/error
-        // remains actionable even if another source has gone stale.
-        for state in [SignalState.blocked, .error, .unknown, .working, .idle] {
+        // A verified active task remains useful even when another transient
+        // session is uncertain. Unknown still outranks idle so green continues
+        // to mean that every observed session has a confirmed terminal state.
+        for state in [SignalState.blocked, .error, .working, .unknown, .idle] {
             if events.contains(where: { $0.state == state }) {
                 return state
             }
