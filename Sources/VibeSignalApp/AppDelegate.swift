@@ -171,7 +171,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let openMenu = NSMenu()
         let openItem = NSMenuItem(title: "Open Workspace", action: nil, keyEquivalent: "")
         openItem.submenu = openMenu
-        let workspaces = currentSnapshot.sessions.compactMap(\.workspace)
+        let workspaces = currentSnapshot.sessions
+            .filter(\.isSessionAvailable)
+            .compactMap(\.workspace)
         if workspaces.isEmpty {
             let none = NSMenuItem(title: "No workspace", action: nil, keyEquivalent: "")
             none.isEnabled = false

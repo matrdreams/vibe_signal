@@ -500,6 +500,65 @@ final class VibeSignalCoreTests: XCTestCase {
         XCTAssertEqual(events.last?.state, .working)
     }
 
+    func testCodexSessionMonitorRetiresDeletedRolloutAndClearsNavigation() throws {
+        let codexHome = try makeTemporaryCodexHome()
+        let sessionID = "019e5982-1111-7222-8333-444455556666"
+        let sessionFile = try writeSessionFile(
+            codexHome: codexHome,
+            sessionID: sessionID,
+            lines: [
+                #"{"timestamp":"2026-05-24T10:22:51.643Z","type":"session_meta","payload":{"id":"019e5982-1111-7222-8333-444455556666","cwd":"/tmp/deleted","originator":"codex-tui"}}"#,
+                #"{"timestamp":"2026-05-24T10:22:51.647Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-deleted"}}"#
+            ]
+        )
+
+        var events: [SignalEvent] = []
+        let monitor = CodexSessionMonitor(
+            configuration: CodexSessionMonitor.Configuration(
+                codexHomeURL: codexHome,
+                refreshInterval: 600,
+                staleAfter: 600
+            )
+        ) { events.append($0) }
+        let initial = Date()
+
+        monitor.scanOnceForTesting(now: initial)
+        XCTAssertEqual(events.last?.state, .working)
+        XCTAssertEqual(
+            events.last?.metadata?["jump_url"],
+            .string("codex://threads/\(sessionID)")
+        )
+
+        try FileManager.default.removeItem(at: sessionFile)
+        monitor.scanOnceForTesting(now: initial.addingTimeInterval(1))
+
+        guard let retired = events.last else {
+            return XCTFail("Expected a terminal event for the removed rollout")
+        }
+        XCTAssertEqual(retired.state, .idle)
+        XCTAssertEqual(retired.reason, SignalReason.interrupted)
+        XCTAssertEqual(retired.metadata?["state_evidence"], .string("session_file_removed"))
+        XCTAssertEqual(retired.metadata?["session_available"], .bool(false))
+        XCTAssertEqual(retired.metadata?["jump_url"], .null)
+        XCTAssertEqual(retired.metadata?["session_file"], .null)
+        XCTAssertFalse(retired.isSessionAvailable)
+
+        let store = StatusStore()
+        for event in events {
+            store.apply(event, now: event.updatedAt)
+        }
+        let snapshot = store.snapshot(now: initial.addingTimeInterval(1))
+        XCTAssertEqual(snapshot.globalState, .idle)
+        XCTAssertTrue(snapshot.activeSessions.isEmpty)
+        XCTAssertTrue(snapshot.recentIdleSessions.isEmpty)
+        XCTAssertEqual(snapshot.sessions.first?.metadata?["jump_url"], .null)
+        XCTAssertEqual(snapshot.sessions.first?.metadata?["session_file"], .null)
+
+        let eventCount = events.count
+        monitor.scanOnceForTesting(now: initial.addingTimeInterval(2))
+        XCTAssertEqual(events.count, eventCount)
+    }
+
     func testCodexSessionMonitorEscalatedCommandBlocksThenReturnsToWorking() throws {
         let codexHome = try makeTemporaryCodexHome()
         let sessionID = "019e5993-3333-7444-8555-666677778888"

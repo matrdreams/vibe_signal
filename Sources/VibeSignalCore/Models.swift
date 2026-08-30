@@ -137,6 +137,13 @@ public struct SignalEvent: Codable, Equatable, Sendable, Identifiable {
         "\(source):\(sessionId)"
     }
 
+    public var isSessionAvailable: Bool {
+        guard case .bool(let available)? = metadata?["session_available"] else {
+            return true
+        }
+        return available
+    }
+
     public init(
         schemaVersion: Int = 1,
         source: String,
@@ -194,11 +201,11 @@ public struct SignalSnapshot: Codable, Equatable, Sendable {
     }
 
     public var activeSessions: [SignalEvent] {
-        sessions.filter { $0.state.isActive }
+        sessions.filter { $0.state.isActive && $0.isSessionAvailable }
     }
 
     public var recentIdleSessions: [SignalEvent] {
-        sessions.filter { $0.state == .idle }
+        sessions.filter { $0.state == .idle && $0.isSessionAvailable }
     }
 
     public static func make(

@@ -163,8 +163,10 @@ The monitor uses Codex's `session_index.jsonl` title so menu rows match the
 Codex sidebar, falling back to a concise title from the latest user prompt
 until the sidebar title is available. Internal subagent rollouts are not shown
 as separate sidebar sessions. Each root session still carries the
-`codex://threads/<session-id>` deep link. Notification types can be switched on
-or off in Settings.
+`codex://threads/<session-id>` deep link. If Codex removes a rollout, Vibe
+Signal immediately retires its active state and clears the invalid deep link
+instead of leaving a yellow, non-resumable task behind. Notification types can
+be switched on or off in Settings.
 
 When the menu bar app is not running, the CLI writes the snapshot file and reports that the hub is offline. Once the app starts, it loads that snapshot and then listens on the socket for live events.
 

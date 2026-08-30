@@ -4,7 +4,8 @@ import VibeSignalCore
 final class SessionNavigator {
     @discardableResult
     func open(_ event: SignalEvent) -> Bool {
-        if let jumpURL = stringMetadata("jump_url", in: event),
+        if event.isSessionAvailable,
+           let jumpURL = stringMetadata("jump_url", in: event),
            let url = URL(string: jumpURL),
            NSWorkspace.shared.open(url) {
             return true

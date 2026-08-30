@@ -110,6 +110,7 @@ final class NotificationCoordinator {
 
     private func shouldNotifyForCompletion(event: SignalEvent, previous: SignalEvent?) -> Bool {
         guard NotificationPreferences.completionEnabled,
+              event.isSessionAvailable,
               event.state == .idle,
               previous?.state.isActive == true,
               let startedAt = activeSince[event.sessionKey] else {

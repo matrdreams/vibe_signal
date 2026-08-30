@@ -93,6 +93,7 @@ public final class CodexSessionMonitor {
         var blockedObservedAt: Date?
         var lastFileModificationDate: Date?
         var sessionFile: String?
+        var isAvailable = true
         var stateEvidence: String = "unconfirmed"
         var stateCertainty: String = "unknown"
 
@@ -420,13 +421,13 @@ public final class CodexSessionMonitor {
 
         if needsFullDiscovery {
             for key in Array(files.keys) where !selectedPaths.contains(key) && !isTrackedFileActive(files[key]) {
-                files.removeValue(forKey: key)
+                discardTrackedFile(key, now: now)
             }
         } else {
             for key in Array(files.keys) where !selectedPaths.contains(key) {
                 guard var tracked = files[key],
                       let attributes = fileAttributes(for: tracked.url) else {
-                    files.removeValue(forKey: key)
+                    discardTrackedFile(key, now: now)
                     continue
                 }
 
@@ -509,7 +510,7 @@ public final class CodexSessionMonitor {
         }
 
         guard let attributes = knownOrFreshAttributes(for: tracked) else {
-            files.removeValue(forKey: key)
+            discardTrackedFile(key, now: now)
             return
         }
 
@@ -532,7 +533,7 @@ public final class CodexSessionMonitor {
 
         if !tracked.seeded {
             guard seedFile(&tracked, size: attributes.size, now: now) else {
-                files.removeValue(forKey: key)
+                discardTrackedFile(key, now: now)
                 return
             }
             tracked.pendingText = trailingPartialLine(from: tracked.url, size: attributes.size)
@@ -555,7 +556,11 @@ public final class CodexSessionMonitor {
 
         guard let data = readData(from: tracked.url, offset: tracked.offset, length: bytesToRead),
               !data.isEmpty else {
-            files[key] = tracked
+            if isFileMissing(tracked.url) {
+                discardTrackedFile(key, now: now)
+            } else {
+                files[key] = tracked
+            }
             return
         }
 
@@ -1300,11 +1305,17 @@ public final class CodexSessionMonitor {
         if let turnID = session.activeTurnID {
             metadata["turn_id"] = .string(turnID)
         }
-        if let sessionFile = session.sessionFile {
+        if session.isAvailable, let sessionFile = session.sessionFile {
             metadata["session_file"] = .string(sessionFile)
+            metadata["jump_url"] = .string("codex://threads/\(session.id)")
+        } else {
+            // Null explicitly replaces navigation metadata already held by the
+            // status store, so a removed rollout can never retain a stale link.
+            metadata["session_file"] = .null
+            metadata["jump_url"] = .null
         }
-        metadata["jump_url"] = .string("codex://threads/\(session.id)")
         metadata["host_bundle_id"] = .string("com.openai.codex")
+        metadata["session_available"] = .bool(session.isAvailable)
         metadata["state_evidence"] = .string(session.stateEvidence)
         metadata["state_certainty"] = .string(session.stateCertainty)
         if let approvalPolicy = session.approvalPolicy {
@@ -1477,6 +1488,35 @@ public final class CodexSessionMonitor {
         }
     }
 
+    private func discardTrackedFile(_ key: String, now: Date) {
+        guard let tracked = files.removeValue(forKey: key),
+              isFileMissing(tracked.url) else {
+            return
+        }
+
+        let sessionID = currentSessionID(for: tracked)
+        guard !files.values.contains(where: { currentSessionID(for: $0) == sessionID }),
+              var session = sessions.removeValue(forKey: sessionID),
+              !session.isSubagent else {
+            return
+        }
+
+        session.activeTurnID = nil
+        session.pendingInteractions.removeAll()
+        session.state = .idle
+        session.reason = SignalReason.interrupted
+        session.message = "Codex task is no longer available"
+        session.startedAt = nil
+        session.updatedAt = now
+        session.blockedObservedAt = nil
+        session.lastFileModificationDate = nil
+        session.sessionFile = nil
+        session.isAvailable = false
+        session.stateEvidence = "session_file_removed"
+        session.stateCertainty = "verified"
+        emit(makeSignalEvent(from: session, now: now))
+    }
+
     private func currentSessionID(for tracked: TrackedFile) -> String {
         tracked.sessionID ?? sessionID(from: tracked.url) ?? tracked.url.deletingPathExtension().lastPathComponent
     }
@@ -1496,6 +1536,18 @@ public final class CodexSessionMonitor {
             return nil
         }
         return FileAttributes(size: sizeValue.uint64Value, modifiedAt: attributes[.modificationDate] as? Date)
+    }
+
+    private func isFileMissing(_ url: URL) -> Bool {
+        do {
+            _ = try fileManager.attributesOfItem(atPath: url.path)
+            return false
+        } catch {
+            let cocoaError = error as NSError
+            return cocoaError.domain == NSCocoaErrorDomain
+                && (cocoaError.code == NSFileNoSuchFileError
+                    || cocoaError.code == NSFileReadNoSuchFileError)
+        }
     }
 
     private func readData(from url: URL, offset: UInt64, length: UInt64) -> Data? {
